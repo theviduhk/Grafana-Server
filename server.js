@@ -603,7 +603,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (!authenticate(req)) {
+  const parsed = url.parse(req.url, true);
+  const pathname = parsed.pathname;
+  const query = parsed.query;
+
+  // NOTE: The original "Project+Task filtered" frontend never sent Basic
+  // Auth credentials (its source server had no auth check at all), so we
+  // exempt /fetch-filtered here to match that frontend's existing behaviour.
+  // Every other endpoint keeps requiring Basic Auth like before.
+  const AUTH_EXEMPT_PATHS = ["/fetch-filtered"];
+  if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
     res.writeHead(401, {
       "WWW-Authenticate": 'Basic realm="QAT Server"',
@@ -612,10 +621,6 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: "Unauthorized" }));
     return;
   }
-
-  const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname;
-  const query = parsed.query;
 
   try {
     // Health check
