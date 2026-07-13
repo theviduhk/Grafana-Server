@@ -1,16 +1,15 @@
 {
-  "name": "qat-server",
+  "name": "qat-server-unified",
   "version": "1.0.0",
-  "description": "QAT hourly reporting server (merged) - fetches BigQuery data via Grafana by team leader, staff, or project+task, enriches with denominators, and pushes to Firebase.",
+  "description": "QAT Server - Unified (Team Leaders + Staff ID + Project/Task filtered)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "dependencies": {
     "axios": "^1.7.7"
   },
-  "license": "ISC"
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
