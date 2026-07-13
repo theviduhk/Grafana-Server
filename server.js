@@ -662,8 +662,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* ---------------- FEATURE 2: Staff-based ---------------- */
-    // GET /fetch-staff?staff_id=G26658-OTL
-    if (pathname === "/fetch-staff" && req.method === "GET") {
+    // GET /fetch-staff?staff_id=G26658-OTL   (canonical path)
+    // GET /fetch?staff_id=G26658-OTL         (legacy alias, kept for existing frontend e.g. Dashboard.tsx)
+    if ((pathname === "/fetch-staff" || pathname === "/fetch") && req.method === "GET") {
       const staffId = String(parsed.query.staff_id || TEAM_LEADERS[0]).trim();
       const data = await fetchSingleStaff(staffId);
       await saveToFirebase(FIREBASE_PATH_STAFF, {
@@ -677,8 +678,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // GET /fetch-staff-all?staff_ids=A,B,C
-    if (pathname === "/fetch-staff-all" && req.method === "GET") {
+    // GET /fetch-staff-all?staff_ids=A,B,C   (canonical path)
+    // GET /fetch-all?staff_ids=A,B,C         (legacy alias, kept for existing frontend e.g. QATOutput2.tsx, Dashboard.tsx)
+    if ((pathname === "/fetch-staff-all" || pathname === "/fetch-all") && req.method === "GET") {
       const requestedIds = parseIdsParam(parsed.query);
       const allData = await fetchAllStaff(requestedIds);
       await saveToFirebase(FIREBASE_PATH_STAFF, {
@@ -779,6 +781,8 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /fetch-tl-all?tl_names=A,B,C           - Fetch all/list team leaders  -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch-staff?staff_id=                 - Fetch by staff_id            -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch-staff-all?staff_ids=A,B,C       - Fetch all/list staff_ids     -> ${FIREBASE_PATH_STAFF}`);
+  console.log(`    GET  /fetch?staff_id=                       - (legacy alias of /fetch-staff)`);
+  console.log(`    GET  /fetch-all?staff_ids=A,B,C             - (legacy alias of /fetch-staff-all)`);
   console.log(`    GET  /fetch-project-task?project=&task=     - Fetch by project+task        -> ${FIREBASE_PATH_PROJECT_TASK}`);
   console.log(`    GET  /staff-lookup                          - Staff name lookup (shared)`);
   console.log(`    GET  /project-task-lookup                   - Project/Task lookup (shared)`);
