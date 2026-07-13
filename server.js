@@ -6,11 +6,10 @@ const url = require("url");
 |--------------------------------------------------------------------------
 | CONFIG
 |--------------------------------------------------------------------------
-| Meka 3 wena server.js codes (TL-based, staff_id-based, project+task-based)
-| ekama file ekakata merge karapu eka. Ekineka logic eka (Grafana login,
-| BigQuery polling, denominator lookup, CSV lookups) shared functions widihata
-| use wenawa. Endpoint 4ක widihata wenas wenas features tika access karanna
-| puluwan, saha ekineka Firebase path ekatama save wenawa.
+| Meka thani server ekakin thanku data 3ma type eka handle karanawa:
+|   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
+|   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
+|   3. Project + Task filtered fetch             -> /qat_filtered.json
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -18,16 +17,16 @@ const QUERY_URL =
 
 const FIREBASE_URL = "https://qat-output-default-rtdb.firebaseio.com";
 
-// Wenas wenas features walata wenas wenas Firebase paths (original 3 codes wලම tibuna widihatama)
-const FIREBASE_PATH_TL = "/TL Hourly.json";           // file 1 -> tl_name based
-const FIREBASE_PATH_STAFF = "/QAT2 Output.json";      // file 2 -> staff_id based
-const FIREBASE_PATH_PROJECT_TASK = "/qat_filtered.json"; // file 3 -> project+task based
+// Wenama Firebase path 3ka - features 3ta anuwa
+const FIREBASE_PATH_TL       = "/TL Hourly.json";     // Team Leader mode
+const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
+const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
 
-// Railway / hosting port config
+// Render port config (Render PORT env eken automatic set wenawa)
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
-// Default Team Leader / Staff IDs (used when no id list given via query params)
+// Default Team Leader / Staff IDs list
 const TEAM_LEADERS = [
   "G26658-OTL",
   "G25883-OTL",
@@ -35,11 +34,11 @@ const TEAM_LEADERS = [
   "G23179-OTL"
 ];
 
-// Staff lookup sheet (shared)
+// Staff lookup sheet
 const STAFF_SHEET_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vTcJSktGEdHycbjqLx-YD7-V1DUCH462h64XxaiuyKv9iK6n2FXgh6VAYvFEkS83DI76b2HJfppeuzd/pub?gid=1860286382&output=csv";
 
-// Project/Task lookup sheet (shared) -- also source of denominator matrix
+// Project/Task lookup sheet (denominator matrix source)
 const PROJECT_TASK_SHEET_URL = () =>
   `https://docs.google.com/spreadsheets/d/e/2PACX-1vTcJSktGEdHycbjqLx-YD7-V1DUCH462h64XxaiuyKv9iK6n2FXgh6VAYvFEkS83DI76b2HJfppeuzd/pub?gid=822634964&output=csv&_=${Date.now()}`;
 
@@ -47,13 +46,9 @@ const PROJECT_TASK_SHEET_URL = () =>
 |--------------------------------------------------------------------------
 | HARDCODED BASIC AUTH
 |--------------------------------------------------------------------------
-| NOTE: production ekaka mewa environment variables walata gahanna hondai
-| (process.env.AUTH_USER / process.env.AUTH_PASS), plain code eke thiyanawanam
-| repo eka public unoth credentials leak wenawa.
-|--------------------------------------------------------------------------
 */
-const AUTH_USER = process.env.AUTH_USER || "admin";
-const AUTH_PASS = process.env.AUTH_PASS || "password123";
+const AUTH_USER = "admin";
+const AUTH_PASS = "password123";
 
 /*
 |--------------------------------------------------------------------------
@@ -89,11 +84,7 @@ function authenticate(req) {
 
 /*
 |--------------------------------------------------------------------------
-| GRAFANA SESSION MANAGER
-|--------------------------------------------------------------------------
-| File 1 & 2 wලට tibuna login-based auto-refresh session manager eka use
-| karanawa (File 3 wලට tibuna hard-coded grafana_session eka use karanne
-| nehe -- eka expire unama okkoma crash wenawa).
+| GRAFANA SESSION MANAGER (auto login + auto refresh on 401/403)
 |--------------------------------------------------------------------------
 */
 let grafanaSession = null;
@@ -102,8 +93,8 @@ let loginPromise = null;
 async function loginToGrafana() {
   console.log("🔐 Logging into Grafana to get fresh session...");
 
-  const username = process.env.GRAFANA_USER || "gss.kurunegala@gssintl.biz";
-  const password = process.env.GRAFANA_PASS || "Gssk@2021";
+  const username = "gss.kurunegala@gssintl.biz";
+  const password = "Gssk@2021";
 
   try {
     const response = await axios.post(
@@ -158,15 +149,15 @@ async function getGrafanaHeaders() {
   };
 }
 
-async function grafanaRequest(method, requestUrl, data = null, retryCount = 0) {
+async function grafanaRequest(method, reqUrl, data = null, retryCount = 0) {
   try {
     const headers = await getGrafanaHeaders();
     const config = { headers, timeout: 30000 };
     let response;
     if (method === 'GET') {
-      response = await axios.get(requestUrl, config);
+      response = await axios.get(reqUrl, config);
     } else if (method === 'POST') {
-      response = await axios.post(requestUrl, data, config);
+      response = await axios.post(reqUrl, data, config);
     }
     return response;
   } catch (error) {
@@ -174,7 +165,7 @@ async function grafanaRequest(method, requestUrl, data = null, retryCount = 0) {
       console.warn("⚠️ Session expired or invalid. Refreshing Grafana session...");
       grafanaSession = null;
       loginPromise = null;
-      return grafanaRequest(method, requestUrl, data, retryCount + 1);
+      return grafanaRequest(method, reqUrl, data, retryCount + 1);
     }
     throw error;
   }
@@ -182,7 +173,7 @@ async function grafanaRequest(method, requestUrl, data = null, retryCount = 0) {
 
 /*
 |--------------------------------------------------------------------------
-| BIGQUERY — poll until job complete (shared)
+| BIGQUERY — poll until job complete
 |--------------------------------------------------------------------------
 */
 async function getQueryResults(resultUrl) {
@@ -196,11 +187,10 @@ async function getQueryResults(resultUrl) {
 
 /*
 |--------------------------------------------------------------------------
-| BUILD SQL — 3 variants (tl_name / staff_id / project+task)
+| BUILD SQL — 3 variants (team leader / staff id / project+task)
 |--------------------------------------------------------------------------
 */
-function buildQueryByTL(tlName) {
-  const safe = String(tlName).replace(/'/g, "\\'");
+function buildQueryByTeamLeader(tlName) {
   return {
     query: `
       #standardSQL
@@ -222,7 +212,7 @@ function buildQueryByTL(tlName) {
           AND CURRENT_TIMESTAMP()
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND team_leader_staff_id = '${safe}'
+        AND team_leader_staff_id = '${tlName}'
       GROUP BY 1, 2, 3, 4
       ORDER BY timestamp
     `,
@@ -230,8 +220,8 @@ function buildQueryByTL(tlName) {
   };
 }
 
-function buildQueryByStaff(staffId) {
-  const safe = String(staffId).replace(/'/g, "\\'");
+function buildQueryByStaffId(staffId) {
+  const safeStaffId = String(staffId).replace(/'/g, "\\'");
   return {
     query: `
       #standardSQL
@@ -253,7 +243,7 @@ function buildQueryByStaff(staffId) {
           AND CURRENT_TIMESTAMP()
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND staff_id = '${safe}'
+        AND staff_id = '${safeStaffId}'
       GROUP BY 1, 2, 3, 4
       ORDER BY timestamp
     `,
@@ -290,7 +280,7 @@ function buildQueryByProjectTask(project, task) {
 
 /*
 |--------------------------------------------------------------------------
-| PROCESS ROWS (shared)
+| PROCESS ROWS
 |--------------------------------------------------------------------------
 */
 function processResults(result) {
@@ -317,7 +307,17 @@ function processResults(result) {
 
 /*
 |--------------------------------------------------------------------------
-| DENOMINATOR LOOKUP (shared) — keys normalized (lowercase + trimmed)
+| FIREBASE SAVE (path parameter eken kaka data save karanawada kiyala decide karanawa)
+|--------------------------------------------------------------------------
+*/
+async function saveToFirebase(firebasePath, payload) {
+  await axios.put(`${FIREBASE_URL}${firebasePath}`, payload);
+  console.log(`  🔥 Firebase updated at "${firebasePath}"`);
+}
+
+/*
+|--------------------------------------------------------------------------
+| DENOMINATOR LOOKUP (normalized keys - lowercase + trimmed)
 |--------------------------------------------------------------------------
 */
 const normKey = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
@@ -387,6 +387,11 @@ async function getDenominatorData(forceRefresh = false) {
   return data;
 }
 
+/*
+|--------------------------------------------------------------------------
+| TASK FALLBACK GROUPS (sheet eke cell eka empty/"-" unoth)
+|--------------------------------------------------------------------------
+*/
 const TASK_FALLBACK_035 = new Set([
   'offline_posm', 'posm_masking', 'posm_voting',
   'stitching', 'stitching_edit',
@@ -408,7 +413,7 @@ function taskFallback(normTask) {
 }
 
 function lookupDenominator(project, task, denominatorData) {
-  const normTask = normKey(task);
+  const normTask    = normKey(task);
   const normProject = normKey(project);
   const exactKey = `${normProject}||${normTask}`;
   if (denominatorData.byProjectTask[exactKey] !== undefined) {
@@ -421,33 +426,19 @@ async function enrichWithDenominator(rows) {
   const denominatorData = await getDenominatorData();
   return rows.map(row => {
     const denominator = lookupDenominator(row.project_name, row.task_name, denominatorData);
-    return {
-      ...row,
-      denominator,
-      wd: row.value * denominator,
-      count: row.value
-    };
+    const wd = row.value * denominator;
+    return { ...row, denominator, wd, count: row.value };
   });
 }
 
 /*
 |--------------------------------------------------------------------------
-| FIREBASE (shared saver — path passed in per feature)
-|--------------------------------------------------------------------------
-*/
-async function saveToFirebase(path, payload) {
-  await axios.put(`${FIREBASE_URL}${path}`, payload);
-  console.log(`  Firebase updated at ${path}`);
-}
-
-/*
-|--------------------------------------------------------------------------
-| FEATURE 1: FETCH BY TEAM LEADER (tl_name) -> /TL Hourly.json
+| FETCH — MODE 1: Team Leader (team_leader_staff_id)
 |--------------------------------------------------------------------------
 */
 async function fetchSingleTL(tlName) {
-  console.log(`  Fetching (TL): tl_name="${tlName}"`);
-  const query = buildQueryByTL(tlName);
+  console.log(`  [TL] Fetching: tl_name="${tlName}"`);
+  const query = buildQueryByTeamLeader(tlName);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
@@ -455,23 +446,19 @@ async function fetchSingleTL(tlName) {
   const result = await getQueryResults(resultUrl);
   let rows = processResults(result);
   rows = await enrichWithDenominator(rows);
-
-  return {
-    tl_name: tlName,
-    rows,
-    total_rows: rows.length,
-    fetched_at: new Date().toISOString()
-  };
+  console.log(`    Rows found: ${rows.length}`);
+  return { tl_name: tlName, rows, total_rows: rows.length, fetched_at: new Date().toISOString() };
 }
 
-async function fetchAllTL(tlList) {
-  const list = (tlList && tlList.length) ? tlList : TEAM_LEADERS;
+async function fetchAllTeamLeaders(list) {
+  const tlList = (list && list.length) ? list : TEAM_LEADERS;
+  console.log(`\n>>> [TL] Fetching data for ${tlList.length} Team Leaders...`);
   const results = await Promise.all(
-    list.map(async (tlName) => {
+    tlList.map(async (tlName) => {
       try {
         return await fetchSingleTL(tlName);
       } catch (err) {
-        console.error(`  Error fetching TL ${tlName}:`, err.message);
+        console.error(`  Error fetching ${tlName}:`, err.message);
         return { tl_name: tlName, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() };
       }
     })
@@ -481,12 +468,12 @@ async function fetchAllTL(tlList) {
 
 /*
 |--------------------------------------------------------------------------
-| FEATURE 2: FETCH BY STAFF (staff_id) -> /QAT2 Output.json
+| FETCH — MODE 2: Staff ID (staff_id)
 |--------------------------------------------------------------------------
 */
 async function fetchSingleStaff(staffId) {
-  console.log(`  Fetching (Staff): staff_id="${staffId}"`);
-  const query = buildQueryByStaff(staffId);
+  console.log(`  [STAFF] Fetching: staff_id="${staffId}"`);
+  const query = buildQueryByStaffId(staffId);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
@@ -494,23 +481,19 @@ async function fetchSingleStaff(staffId) {
   const result = await getQueryResults(resultUrl);
   let rows = processResults(result);
   rows = await enrichWithDenominator(rows);
-
-  return {
-    staff_id: staffId,
-    rows,
-    total_rows: rows.length,
-    fetched_at: new Date().toISOString()
-  };
+  console.log(`    Rows found: ${rows.length}`);
+  return { staff_id: staffId, rows, total_rows: rows.length, fetched_at: new Date().toISOString() };
 }
 
 async function fetchAllStaff(staffIds) {
   const list = (staffIds && staffIds.length) ? staffIds : TEAM_LEADERS;
+  console.log(`\n>>> [STAFF] Fetching data for ${list.length} staff member(s)...`);
   const results = await Promise.all(
     list.map(async (staffId) => {
       try {
         return await fetchSingleStaff(staffId);
       } catch (err) {
-        console.error(`  Error fetching staff ${staffId}:`, err.message);
+        console.error(`  Error fetching ${staffId}:`, err.message);
         return { staff_id: staffId, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() };
       }
     })
@@ -520,11 +503,12 @@ async function fetchAllStaff(staffIds) {
 
 /*
 |--------------------------------------------------------------------------
-| FEATURE 3: FETCH BY PROJECT + TASK -> /qat_filtered.json
+| FETCH — MODE 3: Project + Task filtered (no denominator enrichment,
+| matches original behaviour of the filtered-only server)
 |--------------------------------------------------------------------------
 */
-async function fetchByProjectTask(project, task) {
-  console.log(`  Fetching (Project/Task): project="${project}" task="${task}"`);
+async function fetchFilteredByProjectTask(project, task) {
+  console.log(`\n>>> [FILTERED] Fetching: project="${project}" task="${task}"`);
   const query = buildQueryByProjectTask(project, task);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
@@ -532,12 +516,13 @@ async function fetchByProjectTask(project, task) {
   const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
   const result = await getQueryResults(resultUrl);
   const rows = processResults(result);
+  console.log(`  Rows found: ${rows.length}`);
   return rows;
 }
 
 /*
 |--------------------------------------------------------------------------
-| SHARED LOOKUPS: STAFF SHEET / PROJECT-TASK SHEET / DENOMINATOR
+| STAFF LOOKUP
 |--------------------------------------------------------------------------
 */
 async function fetchStaffLookup() {
@@ -550,8 +535,14 @@ async function fetchStaffLookup() {
   }
 }
 
+/*
+|--------------------------------------------------------------------------
+| PROJECT/TASK LOOKUP (raw records)
+|--------------------------------------------------------------------------
+*/
 async function fetchProjectTaskLookup() {
   try {
+    console.log("📊 Fetching project/task lookup data...");
     const response = await axios.get(PROJECT_TASK_SHEET_URL(), {
       responseType: 'text',
       timeout: 30000
@@ -569,10 +560,13 @@ async function fetchProjectTaskLookup() {
     for (let i = 1; i < lines.length; i++) {
       const cells = splitLine(lines[i]);
       const record = {};
-      headers.forEach((header, idx) => { record[header] = cells[idx] || ''; });
+      headers.forEach((header, idx) => {
+        record[header] = cells[idx] || '';
+      });
       records.push(record);
     }
 
+    console.log(`✅ Loaded ${records.length} project/task lookup records`);
     return records;
   } catch (err) {
     console.error("❌ Failed to fetch project/task lookup:", err.message);
@@ -586,8 +580,8 @@ async function fetchProjectTaskLookup() {
 |--------------------------------------------------------------------------
 */
 function parseIdsParam(query) {
-  // Accepts `ids=ID1,ID2,ID3` (or single value)
-  const raw = query.staff_ids || query.tl_names || query.ids;
+  // `ids=A,B,C` or single `id=A` style params (used for staff_ids/tl_names)
+  const raw = query.staff_ids || query.staff_id || query.tl_names || query.tl_name;
   if (!raw) return [];
   if (Array.isArray(raw)) return raw.map(s => String(s).trim()).filter(Boolean);
   return String(raw).split(',').map(s => s.trim()).filter(Boolean);
@@ -600,6 +594,7 @@ function parseIdsParam(query) {
 */
 const server = http.createServer(async (req, res) => {
   console.log(`${req.method} ${req.url}`);
+
   setCorsHeaders(res);
 
   if (req.method === "OPTIONS") {
@@ -610,13 +605,17 @@ const server = http.createServer(async (req, res) => {
 
   if (!authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
-    res.writeHead(401, { "WWW-Authenticate": 'Basic realm="QAT Server"', "Content-Type": "application/json" });
+    res.writeHead(401, {
+      "WWW-Authenticate": 'Basic realm="QAT Server"',
+      "Content-Type": "application/json"
+    });
     res.end(JSON.stringify({ error: "Unauthorized" }));
     return;
   }
 
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname;
+  const query = parsed.query;
 
   try {
     // Health check
@@ -624,17 +623,85 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server (merged)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task)",
         time: new Date().toISOString(),
         cors: "enabled"
       }));
       return;
     }
 
-    /* ---------------- FEATURE 1: TL-based ---------------- */
-    // GET /fetch-tl?tl_name=G26658-OTL
-    if (pathname === "/fetch-tl" && req.method === "GET") {
-      const tlName = String(parsed.query.tl_name || TEAM_LEADERS[0]).trim();
+    // -------------------------------------------------------------
+    // MODE 1: TEAM LEADER — /fetch-all?mode=tl  (default mode)
+    // -------------------------------------------------------------
+    if (pathname === "/fetch-all" && req.method === "GET" && (!query.mode || query.mode === "tl")) {
+      const requestedIds = parseIdsParam(query);
+      const allData = await fetchAllTeamLeaders(requestedIds);
+      await saveToFirebase(FIREBASE_PATH_TL, {
+        updated_at: new Date().toISOString(),
+        total_leaders: allData.length,
+        data: allData
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        mode: "tl",
+        data: allData,
+        total_leaders: allData.length,
+        updated_at: new Date().toISOString()
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // MODE 2: STAFF ID — /fetch-all?mode=staff
+    // -------------------------------------------------------------
+    if (pathname === "/fetch-all" && req.method === "GET" && query.mode === "staff") {
+      const requestedIds = parseIdsParam(query);
+      const allData = await fetchAllStaff(requestedIds);
+      await saveToFirebase(FIREBASE_PATH_STAFF, {
+        updated_at: new Date().toISOString(),
+        total_leaders: allData.length,
+        data: allData
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        mode: "staff",
+        data: allData,
+        total_leaders: allData.length,
+        staff_ids: requestedIds.length ? requestedIds : TEAM_LEADERS,
+        updated_at: new Date().toISOString()
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
+    // Single fetch — /fetch?tl_name=...  OR  /fetch?staff_id=...
+    // -------------------------------------------------------------
+    if (pathname === "/fetch" && req.method === "GET") {
+      // staff_id takes priority if both are supplied
+      if (query.staff_id) {
+        const staffId = String(query.staff_id).trim();
+        const data = await fetchSingleStaff(staffId);
+        await saveToFirebase(FIREBASE_PATH_STAFF, {
+          updated_at: new Date().toISOString(),
+          total_rows: data.total_rows,
+          filter_config: { staff_id: staffId },
+          data: data.rows,
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          success: true,
+          mode: "staff",
+          rows: data.rows,
+          total: data.total_rows,
+          staff_id: staffId,
+          updated_at: new Date().toISOString(),
+        }));
+        return;
+      }
+
+      const tlName = String(query.tl_name || TEAM_LEADERS[0]).trim();
       const data = await fetchSingleTL(tlName);
       await saveToFirebase(FIREBASE_PATH_TL, {
         updated_at: new Date().toISOString(),
@@ -643,61 +710,23 @@ const server = http.createServer(async (req, res) => {
         data: data.rows,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, rows: data.rows, total: data.total_rows, tl_name: tlName, updated_at: new Date().toISOString() }));
-      return;
-    }
-
-    // GET /fetch-tl-all?tl_names=A,B,C
-    if (pathname === "/fetch-tl-all" && req.method === "GET") {
-      const requestedIds = parseIdsParam(parsed.query);
-      const allData = await fetchAllTL(requestedIds);
-      await saveToFirebase(FIREBASE_PATH_TL, {
+      res.end(JSON.stringify({
+        success: true,
+        mode: "tl",
+        rows: data.rows,
+        total: data.total_rows,
+        tl_name: tlName,
         updated_at: new Date().toISOString(),
-        total_leaders: allData.length,
-        data: allData
-      });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, data: allData, total_leaders: allData.length, updated_at: new Date().toISOString() }));
+      }));
       return;
     }
 
-    /* ---------------- FEATURE 2: Staff-based ---------------- */
-    // GET /fetch-staff?staff_id=G26658-OTL   (canonical path)
-    // GET /fetch?staff_id=G26658-OTL         (legacy alias, kept for existing frontend e.g. Dashboard.tsx)
-    if ((pathname === "/fetch-staff" || pathname === "/fetch") && req.method === "GET") {
-      const staffId = String(parsed.query.staff_id || TEAM_LEADERS[0]).trim();
-      const data = await fetchSingleStaff(staffId);
-      await saveToFirebase(FIREBASE_PATH_STAFF, {
-        updated_at: new Date().toISOString(),
-        total_rows: data.total_rows,
-        filter_config: { staff_id: staffId },
-        data: data.rows,
-      });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, rows: data.rows, total: data.total_rows, staff_id: staffId, updated_at: new Date().toISOString() }));
-      return;
-    }
-
-    // GET /fetch-staff-all?staff_ids=A,B,C   (canonical path)
-    // GET /fetch-all?staff_ids=A,B,C         (legacy alias, kept for existing frontend e.g. QATOutput2.tsx, Dashboard.tsx)
-    if ((pathname === "/fetch-staff-all" || pathname === "/fetch-all") && req.method === "GET") {
-      const requestedIds = parseIdsParam(parsed.query);
-      const allData = await fetchAllStaff(requestedIds);
-      await saveToFirebase(FIREBASE_PATH_STAFF, {
-        updated_at: new Date().toISOString(),
-        total_leaders: allData.length,
-        data: allData
-      });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, data: allData, total_leaders: allData.length, staff_ids: requestedIds.length ? requestedIds : TEAM_LEADERS, updated_at: new Date().toISOString() }));
-      return;
-    }
-
-    /* ---------------- FEATURE 3: Project + Task ---------------- */
-    // GET /fetch-project-task?project=XXX&task=YYY
-    if (pathname === "/fetch-project-task" && req.method === "GET") {
-      const project = String(parsed.query.project || "").trim();
-      const task = String(parsed.query.task || "").trim();
+    // -------------------------------------------------------------
+    // MODE 3: PROJECT + TASK FILTERED — /fetch-filtered?project=&task=
+    // -------------------------------------------------------------
+    if (pathname === "/fetch-filtered" && req.method === "GET") {
+      const project = (query.project || "").trim();
+      const task = (query.task || "").trim();
 
       if (!project || !task) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -705,19 +734,27 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const rows = await fetchByProjectTask(project, task);
-      await saveToFirebase(FIREBASE_PATH_PROJECT_TASK, {
+      const rows = await fetchFilteredByProjectTask(project, task);
+      await saveToFirebase(FIREBASE_PATH_FILTERED, {
         updated_at: new Date().toISOString(),
         total_rows: rows.length,
         filter_config: { project, task },
         data: rows,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, rows, total: rows.length, project, task, updated_at: new Date().toISOString() }));
+      res.end(JSON.stringify({
+        success: true,
+        mode: "filtered",
+        rows,
+        total: rows.length,
+        project,
+        task,
+        updated_at: new Date().toISOString(),
+      }));
       return;
     }
 
-    /* ---------------- SHARED LOOKUPS ---------------- */
+    // Staff lookup
     if (pathname === "/staff-lookup" && req.method === "GET") {
       const csv = await fetchStaffLookup();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -725,6 +762,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Project/Task lookup
     if (pathname === "/project-task-lookup" && req.method === "GET") {
       try {
         const data = await fetchProjectTaskLookup();
@@ -737,14 +775,18 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Denominator lookup
     if (pathname === "/denominator-lookup" && req.method === "GET") {
       try {
-        const data = await getDenominatorData(true);
+        const data = await getDenominatorData(true); // force refresh
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           success: true,
           data,
-          count: { byProjectTask: Object.keys(data.byProjectTask).length, byGID: Object.keys(data.byGID).length }
+          count: {
+            byProjectTask: Object.keys(data.byProjectTask).length,
+            byGID: Object.keys(data.byGID).length
+          }
         }));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -753,9 +795,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (pathname === "/team-leaders" && req.method === "GET") {
+    // Default staff/TL id list
+    if ((pathname === "/team-leaders" || pathname === "/staff-ids") && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ team_leaders: TEAM_LEADERS, staff_ids: TEAM_LEADERS, count: TEAM_LEADERS.length }));
+      res.end(JSON.stringify({
+        staff_ids: TEAM_LEADERS,
+        team_leaders: TEAM_LEADERS,
+        count: TEAM_LEADERS.length
+      }));
       return;
     }
 
@@ -766,27 +813,33 @@ const server = http.createServer(async (req, res) => {
     console.error("❌ Server Error:", error.message);
     console.error("  Stack:", error.stack);
     res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: error.message, details: error.stack }));
+    res.end(JSON.stringify({
+      error: error.message,
+      details: error.stack
+    }));
   }
 });
 
+// Start server
 server.listen(PORT, HOST, () => {
   console.log("================================");
-  console.log(`  🚀 QAT Server (merged) running on http://${HOST}:${PORT}`);
+  console.log(`  🚀 QAT Server (Unified) running on http://${HOST}:${PORT}`);
   console.log(`  🔐 Basic Auth: ${AUTH_USER} / ${AUTH_PASS}`);
   console.log(`  🌐 CORS: Enabled for all origins`);
+  console.log(`  🔥 Firebase paths:`);
+  console.log(`     TL mode      -> ${FIREBASE_PATH_TL}`);
+  console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
+  console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
   console.log(`  📊 Endpoints:`);
-  console.log(`    GET  /                                     - Health check`);
-  console.log(`    GET  /fetch-tl?tl_name=                     - Fetch by team leader        -> ${FIREBASE_PATH_TL}`);
-  console.log(`    GET  /fetch-tl-all?tl_names=A,B,C           - Fetch all/list team leaders  -> ${FIREBASE_PATH_TL}`);
-  console.log(`    GET  /fetch-staff?staff_id=                 - Fetch by staff_id            -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`    GET  /fetch-staff-all?staff_ids=A,B,C       - Fetch all/list staff_ids     -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`    GET  /fetch?staff_id=                       - (legacy alias of /fetch-staff)`);
-  console.log(`    GET  /fetch-all?staff_ids=A,B,C             - (legacy alias of /fetch-staff-all)`);
-  console.log(`    GET  /fetch-project-task?project=&task=     - Fetch by project+task        -> ${FIREBASE_PATH_PROJECT_TASK}`);
-  console.log(`    GET  /staff-lookup                          - Staff name lookup (shared)`);
-  console.log(`    GET  /project-task-lookup                   - Project/Task lookup (shared)`);
-  console.log(`    GET  /denominator-lookup                    - Denominator lookup (shared)`);
-  console.log(`    GET  /team-leaders                          - Default TL/staff id list`);
+  console.log(`    GET  /                                  - Health check`);
+  console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
+  console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids -> ${FIREBASE_PATH_STAFF}`);
+  console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
+  console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
+  console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
+  console.log(`    GET  /staff-lookup                      - Staff name lookup`);
+  console.log(`    GET  /project-task-lookup                - Project/Task lookup`);
+  console.log(`    GET  /denominator-lookup                 - Denominator lookup`);
+  console.log(`    GET  /team-leaders | /staff-ids          - Default ID list`);
   console.log("================================");
 });
