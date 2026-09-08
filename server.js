@@ -10,6 +10,13 @@ const url = require("url");
 |   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
 |   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
 |   3. Project + Task filtered fetch             -> /qat_filtered.json
+|
+| Sema fetch mode 3ma dæn OPTIONAL `date=YYYY-MM-DD` query param eka
+| support karanawa. Date eka denne nathnam (allathwa waradi format eka
+| dunnoth) default eka widihata "today" (CURRENT_TIMESTAMP() up-to-the-
+| minute) query eka run wenawa - meka appearance eken kalin behavior ekama.
+| Past date ekak dunnoth, e dawase pura 24 pæya (00:00:00 sita 23:59:59.999999
+| dakwa) BigQuery walin fetch karanawa.
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -80,6 +87,43 @@ function authenticate(req) {
   } catch {
     return false;
   }
+}
+
+/*
+|--------------------------------------------------------------------------
+| DATE PARAM HELPERS
+|--------------------------------------------------------------------------
+| `date` query param eka `YYYY-MM-DD` format ekata match wenawada balala,
+| SQL injection wenna bæ widihata sanitize karala, valid nam ema string eka
+| return karanawa. Invalid/missing unoth `null` return karanawa (=> "today").
+|--------------------------------------------------------------------------
+*/
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseDateParam(query) {
+  const raw = query && query.date ? String(query.date).trim() : "";
+  if (!raw) return null;
+  if (!DATE_RE.test(raw)) return null;
+  // Extra sanity check - make sure it's a real calendar date (e.g. rejects
+  // 2026-02-31), not just a string that matches the shape.
+  const [y, m, d] = raw.split("-").map(Number);
+  const check = new Date(Date.UTC(y, m - 1, d));
+  if (check.getUTCFullYear() !== y || check.getUTCMonth() !== m - 1 || check.getUTCDate() !== d) {
+    return null;
+  }
+  return raw;
+}
+
+// Builds the BigQuery WHERE-clause fragment for the requested day.
+//  - No date (or invalid date) => same "today, up to right now" window as
+//    the original queries always used.
+//  - A specific past/present date => the full 00:00:00–23:59:59.999999
+//    window for that calendar date.
+function buildDateRangeClause(dateStr) {
+  if (dateStr) {
+    return `event_timestamp BETWEEN TIMESTAMP('${dateStr} 00:00:00') AND TIMESTAMP('${dateStr} 23:59:59.999999')`;
+  }
+  return `event_timestamp BETWEEN TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY) AND CURRENT_TIMESTAMP()`;
 }
 
 /*
@@ -189,8 +233,12 @@ async function getQueryResults(resultUrl) {
 |--------------------------------------------------------------------------
 | BUILD SQL — 3 variants (team leader / staff id / project+task)
 |--------------------------------------------------------------------------
+| Every builder now takes an optional `dateStr` (YYYY-MM-DD, already
+| validated by parseDateParam) and swaps in the matching date-range clause.
+|--------------------------------------------------------------------------
 */
-function buildQueryByTeamLeader(tlName) {
+function buildQueryByTeamLeader(tlName, dateStr) {
+  const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
       #standardSQL
@@ -207,9 +255,7 @@ function buildQueryByTeamLeader(tlName) {
         ) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
       WHERE
-        event_timestamp BETWEEN
-          TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY)
-          AND CURRENT_TIMESTAMP()
+        ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
         AND team_leader_staff_id = '${tlName}'
@@ -220,8 +266,9 @@ function buildQueryByTeamLeader(tlName) {
   };
 }
 
-function buildQueryByStaffId(staffId) {
+function buildQueryByStaffId(staffId, dateStr) {
   const safeStaffId = String(staffId).replace(/'/g, "\\'");
+  const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
       #standardSQL
@@ -238,9 +285,7 @@ function buildQueryByStaffId(staffId) {
         ) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
       WHERE
-        event_timestamp BETWEEN
-          TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY)
-          AND CURRENT_TIMESTAMP()
+        ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
         AND staff_id = '${safeStaffId}'
@@ -251,9 +296,10 @@ function buildQueryByStaffId(staffId) {
   };
 }
 
-function buildQueryByProjectTask(project, task) {
+function buildQueryByProjectTask(project, task, dateStr) {
   const safeProject = String(project).replace(/'/g, "\\'");
   const safeTask = String(task).replace(/'/g, "\\'");
+  const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
       #standardSQL
@@ -265,9 +311,7 @@ function buildQueryByProjectTask(project, task) {
         SUM(count) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
       WHERE
-        event_timestamp BETWEEN
-          TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY)
-          AND CURRENT_TIMESTAMP()
+        ${dateClause}
         AND task_name IS NOT NULL
         AND project_name = '${safeProject}'
         AND task_name    = '${safeTask}'
@@ -436,9 +480,9 @@ async function enrichWithDenominator(rows) {
 | FETCH — MODE 1: Team Leader (team_leader_staff_id)
 |--------------------------------------------------------------------------
 */
-async function fetchSingleTL(tlName) {
-  console.log(`  [TL] Fetching: tl_name="${tlName}"`);
-  const query = buildQueryByTeamLeader(tlName);
+async function fetchSingleTL(tlName, dateStr) {
+  console.log(`  [TL] Fetching: tl_name="${tlName}" date="${dateStr || 'today'}"`);
+  const query = buildQueryByTeamLeader(tlName, dateStr);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
@@ -450,13 +494,13 @@ async function fetchSingleTL(tlName) {
   return { tl_name: tlName, rows, total_rows: rows.length, fetched_at: new Date().toISOString() };
 }
 
-async function fetchAllTeamLeaders(list) {
+async function fetchAllTeamLeaders(list, dateStr) {
   const tlList = (list && list.length) ? list : TEAM_LEADERS;
-  console.log(`\n>>> [TL] Fetching data for ${tlList.length} Team Leaders...`);
+  console.log(`\n>>> [TL] Fetching data for ${tlList.length} Team Leaders... date="${dateStr || 'today'}"`);
   const results = await Promise.all(
     tlList.map(async (tlName) => {
       try {
-        return await fetchSingleTL(tlName);
+        return await fetchSingleTL(tlName, dateStr);
       } catch (err) {
         console.error(`  Error fetching ${tlName}:`, err.message);
         return { tl_name: tlName, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() };
@@ -471,9 +515,9 @@ async function fetchAllTeamLeaders(list) {
 | FETCH — MODE 2: Staff ID (staff_id)
 |--------------------------------------------------------------------------
 */
-async function fetchSingleStaff(staffId) {
-  console.log(`  [STAFF] Fetching: staff_id="${staffId}"`);
-  const query = buildQueryByStaffId(staffId);
+async function fetchSingleStaff(staffId, dateStr) {
+  console.log(`  [STAFF] Fetching: staff_id="${staffId}" date="${dateStr || 'today'}"`);
+  const query = buildQueryByStaffId(staffId, dateStr);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
@@ -485,13 +529,13 @@ async function fetchSingleStaff(staffId) {
   return { staff_id: staffId, rows, total_rows: rows.length, fetched_at: new Date().toISOString() };
 }
 
-async function fetchAllStaff(staffIds) {
+async function fetchAllStaff(staffIds, dateStr) {
   const list = (staffIds && staffIds.length) ? staffIds : TEAM_LEADERS;
-  console.log(`\n>>> [STAFF] Fetching data for ${list.length} staff member(s)...`);
+  console.log(`\n>>> [STAFF] Fetching data for ${list.length} staff member(s)... date="${dateStr || 'today'}"`);
   const results = await Promise.all(
     list.map(async (staffId) => {
       try {
-        return await fetchSingleStaff(staffId);
+        return await fetchSingleStaff(staffId, dateStr);
       } catch (err) {
         console.error(`  Error fetching ${staffId}:`, err.message);
         return { staff_id: staffId, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() };
@@ -507,9 +551,9 @@ async function fetchAllStaff(staffIds) {
 | matches original behaviour of the filtered-only server)
 |--------------------------------------------------------------------------
 */
-async function fetchFilteredByProjectTask(project, task) {
-  console.log(`\n>>> [FILTERED] Fetching: project="${project}" task="${task}"`);
-  const query = buildQueryByProjectTask(project, task);
+async function fetchFilteredByProjectTask(project, task, dateStr) {
+  console.log(`\n>>> [FILTERED] Fetching: project="${project}" task="${task}" date="${dateStr || 'today'}"`);
+  const query = buildQueryByProjectTask(project, task, dateStr);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
@@ -636,13 +680,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 1: TEAM LEADER — /fetch-all?mode=tl  (default mode)
+    // MODE 1: TEAM LEADER — /fetch-all?mode=tl&date=YYYY-MM-DD  (default mode)
     // -------------------------------------------------------------
     if (pathname === "/fetch-all" && req.method === "GET" && (!query.mode || query.mode === "tl")) {
       const requestedIds = parseIdsParam(query);
-      const allData = await fetchAllTeamLeaders(requestedIds);
+      const dateStr = parseDateParam(query);
+      const allData = await fetchAllTeamLeaders(requestedIds, dateStr);
       await saveToFirebase(FIREBASE_PATH_TL, {
         updated_at: new Date().toISOString(),
+        date: dateStr || "today",
         total_leaders: allData.length,
         data: allData
       });
@@ -650,6 +696,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         success: true,
         mode: "tl",
+        date: dateStr || "today",
         data: allData,
         total_leaders: allData.length,
         updated_at: new Date().toISOString()
@@ -658,13 +705,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 2: STAFF ID — /fetch-all?mode=staff
+    // MODE 2: STAFF ID — /fetch-all?mode=staff&date=YYYY-MM-DD
     // -------------------------------------------------------------
     if (pathname === "/fetch-all" && req.method === "GET" && query.mode === "staff") {
       const requestedIds = parseIdsParam(query);
-      const allData = await fetchAllStaff(requestedIds);
+      const dateStr = parseDateParam(query);
+      const allData = await fetchAllStaff(requestedIds, dateStr);
       await saveToFirebase(FIREBASE_PATH_STAFF, {
         updated_at: new Date().toISOString(),
+        date: dateStr || "today",
         total_leaders: allData.length,
         data: allData
       });
@@ -672,6 +721,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         success: true,
         mode: "staff",
+        date: dateStr || "today",
         data: allData,
         total_leaders: allData.length,
         staff_ids: requestedIds.length ? requestedIds : TEAM_LEADERS,
@@ -682,22 +732,27 @@ const server = http.createServer(async (req, res) => {
 
     // -------------------------------------------------------------
     // Single fetch — /fetch?tl_name=...  OR  /fetch?staff_id=...
+    // Both accept an optional &date=YYYY-MM-DD
     // -------------------------------------------------------------
     if (pathname === "/fetch" && req.method === "GET") {
+      const dateStr = parseDateParam(query);
+
       // staff_id takes priority if both are supplied
       if (query.staff_id) {
         const staffId = String(query.staff_id).trim();
-        const data = await fetchSingleStaff(staffId);
+        const data = await fetchSingleStaff(staffId, dateStr);
         await saveToFirebase(FIREBASE_PATH_STAFF, {
           updated_at: new Date().toISOString(),
+          date: dateStr || "today",
           total_rows: data.total_rows,
-          filter_config: { staff_id: staffId },
+          filter_config: { staff_id: staffId, date: dateStr || "today" },
           data: data.rows,
         });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           success: true,
           mode: "staff",
+          date: dateStr || "today",
           rows: data.rows,
           total: data.total_rows,
           staff_id: staffId,
@@ -707,17 +762,19 @@ const server = http.createServer(async (req, res) => {
       }
 
       const tlName = String(query.tl_name || TEAM_LEADERS[0]).trim();
-      const data = await fetchSingleTL(tlName);
+      const data = await fetchSingleTL(tlName, dateStr);
       await saveToFirebase(FIREBASE_PATH_TL, {
         updated_at: new Date().toISOString(),
+        date: dateStr || "today",
         total_rows: data.total_rows,
-        filter_config: { tl_name: tlName },
+        filter_config: { tl_name: tlName, date: dateStr || "today" },
         data: data.rows,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         mode: "tl",
+        date: dateStr || "today",
         rows: data.rows,
         total: data.total_rows,
         tl_name: tlName,
@@ -727,11 +784,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 3: PROJECT + TASK FILTERED — /fetch-filtered?project=&task=
+    // MODE 3: PROJECT + TASK FILTERED — /fetch-filtered?project=&task=&date=YYYY-MM-DD
     // -------------------------------------------------------------
     if (pathname === "/fetch-filtered" && req.method === "GET") {
       const project = (query.project || "").trim();
       const task = (query.task || "").trim();
+      const dateStr = parseDateParam(query);
 
       if (!project || !task) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -739,17 +797,19 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const rows = await fetchFilteredByProjectTask(project, task);
+      const rows = await fetchFilteredByProjectTask(project, task, dateStr);
       await saveToFirebase(FIREBASE_PATH_FILTERED, {
         updated_at: new Date().toISOString(),
+        date: dateStr || "today",
         total_rows: rows.length,
-        filter_config: { project, task },
+        filter_config: { project, task, date: dateStr || "today" },
         data: rows,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         mode: "filtered",
+        date: dateStr || "today",
         rows,
         total: rows.length,
         project,
@@ -835,7 +895,7 @@ server.listen(PORT, HOST, () => {
   console.log(`     TL mode      -> ${FIREBASE_PATH_TL}`);
   console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
   console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
-  console.log(`  📊 Endpoints:`);
+  console.log(`  📊 Endpoints (all accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
   console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids -> ${FIREBASE_PATH_STAFF}`);
