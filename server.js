@@ -324,6 +324,30 @@ function buildQueryByProjectTask(project, task, dateStr) {
 
 /*
 |--------------------------------------------------------------------------
+| TEMPLATE NAME LOOKUP
+|--------------------------------------------------------------------------
+| Some tasks share the same underlying UI/template, so we tag them with a
+| common `template_name` value. Only the tasks listed below get a
+| template_name - everything else gets null (no template_name grouping).
+|--------------------------------------------------------------------------
+*/
+const normKeySimple = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+
+const TEMPLATE_NAME_TASKS = new Set([
+  'voting_engine',
+  'offline_validation',
+  'voting',
+  'validation',
+  'offline_voting'
+]);
+
+function getTemplateName(taskName) {
+  const normTask = normKeySimple(taskName);
+  return TEMPLATE_NAME_TASKS.has(normTask) ? 'voting_engine' : null;
+}
+
+/*
+|--------------------------------------------------------------------------
 | PROCESS ROWS
 |--------------------------------------------------------------------------
 */
@@ -346,6 +370,7 @@ function processResults(result) {
       task_name: obj.task_name || "",
       staff_id: obj.staff_id || "",
       value: Number(obj.value || 0),
+      template_name: getTemplateName(obj.task_name),
     }));
 }
 
