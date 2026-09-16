@@ -247,6 +247,7 @@ function buildQueryByTeamLeader(tlName, dateStr) {
         project_name,
         task_name,
         staff_id,
+        template_name,
         SUM(
           CASE
             WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
@@ -259,7 +260,7 @@ function buildQueryByTeamLeader(tlName, dateStr) {
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
         AND team_leader_staff_id = '${tlName}'
-      GROUP BY 1, 2, 3, 4
+      GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
     useLegacySql: false,
@@ -277,6 +278,7 @@ function buildQueryByStaffId(staffId, dateStr) {
         project_name,
         task_name,
         staff_id,
+        template_name,
         SUM(
           CASE
             WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
@@ -289,7 +291,7 @@ function buildQueryByStaffId(staffId, dateStr) {
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
         AND staff_id = '${safeStaffId}'
-      GROUP BY 1, 2, 3, 4
+      GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
     useLegacySql: false,
@@ -308,6 +310,7 @@ function buildQueryByProjectTask(project, task, dateStr) {
         project_name,
         task_name,
         staff_id,
+        template_name,
         SUM(count) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
       WHERE
@@ -315,7 +318,7 @@ function buildQueryByProjectTask(project, task, dateStr) {
         AND task_name IS NOT NULL
         AND project_name = '${safeProject}'
         AND task_name    = '${safeTask}'
-      GROUP BY 1, 2, 3, 4
+      GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
     useLegacySql: false,
@@ -341,9 +344,8 @@ const TEMPLATE_NAME_TASKS = new Set([
   'offline_voting'
 ]);
 
-function getTemplateName(taskName) {
-  const normTask = normKeySimple(taskName);
-  return TEMPLATE_NAME_TASKS.has(normTask) ? 'voting_engine' : null;
+function isTemplateNameTask(taskName) {
+  return TEMPLATE_NAME_TASKS.has(normKeySimple(taskName));
 }
 
 /*
@@ -372,9 +374,8 @@ function processResults(result) {
         staff_id: obj.staff_id || "",
         value: Number(obj.value || 0),
       };
-      const templateName = getTemplateName(obj.task_name);
-      if (templateName) {
-        row.template_name = templateName;
+      if (isTemplateNameTask(obj.task_name) && obj.template_name) {
+        row.template_name = obj.template_name;
       }
       return row;
     });
