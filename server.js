@@ -364,14 +364,20 @@ function processResults(result) {
       const staff = String(obj.staff_id || "").trim().toLowerCase();
       return staff !== "" && staff !== "auto_stitch";
     })
-    .map(obj => ({
-      timestamp: obj.timestamp || "",
-      project_name: obj.project_name || "",
-      task_name: obj.task_name || "",
-      staff_id: obj.staff_id || "",
-      value: Number(obj.value || 0),
-      template_name: getTemplateName(obj.task_name),
-    }));
+    .map(obj => {
+      const row = {
+        timestamp: obj.timestamp || "",
+        project_name: obj.project_name || "",
+        task_name: obj.task_name || "",
+        staff_id: obj.staff_id || "",
+        value: Number(obj.value || 0),
+      };
+      const templateName = getTemplateName(obj.task_name);
+      if (templateName) {
+        row.template_name = templateName;
+      }
+      return row;
+    });
 }
 
 /*
