@@ -641,7 +641,10 @@ function lookupDenominator(project, task, denominatorData, templateName) {
   // "Repair Only" when the row's own template_name is "display", and
   // "Repair & Attribute" for every other template_name.
   if (normProject === 'pges') {
-    const subtask = normKey(templateName) === 'display' ? 'Repair Only' : 'Repair & Attribute';
+    // "Display" kiyana word eka template_name eke kohewath (exact match
+    // nathuwa, substring widihata) thiyenawa nam "Repair Only" - nathnam
+    // "Repair & Attribute".
+    const subtask = normKey(templateName).includes('display') ? 'Repair Only' : 'Repair & Attribute';
     const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   } else if (UF_PRIORITY_PROJECTS.has(normProject)) {
