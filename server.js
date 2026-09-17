@@ -374,7 +374,16 @@ function processResults(result) {
         staff_id: obj.staff_id || "",
         value: Number(obj.value || 0),
       };
-      if (isTemplateNameTask(obj.task_name) && obj.template_name) {
+      // template_name eka row ekata attach karanne "voting/validation"
+      // vage TEMPLATE_NAME_TASKS walata witharak neme - PGES walatath
+      // (task eka monawa unath) denominator lookup eka (Repair Only vs
+      // Repair & Attribute) template_name uda depend wena nisa eka
+      // danna oni. Meka nathnam lookupDenominator ekata templateName
+      // ehema undefined widihata yanawa, e nisa PGES ta hamadama
+      // "Repair & Attribute" witharak select wela "Repair Only" (Display)
+      // case eka never trigger wenne nathi.
+      const isPges = normKeySimple(obj.project_name) === 'pges';
+      if ((isTemplateNameTask(obj.task_name) || isPges) && obj.template_name) {
         row.template_name = obj.template_name;
       }
       return row;
