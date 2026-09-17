@@ -565,30 +565,20 @@ function lookupUFDenominator(project, taskName, templateName, ufData) {
   if (!ufData.projects.has(normProject)) return undefined;
 
   const normTemplate = normKey(templateName);
-  const normTask = normKey(taskName);
 
-  // "pges" has its own dedicated rules that override the generic
-  // voting/validation grouping below:
-  //   - task_name voting_engine / voting  -> denominator comes from the
-  //     MAIN Denominator Sheet (first table), not from this UF table.
-  //   - task_name validation              -> denominator comes from this
-  //     UF table's "Repair Only" / "Repair & Attribute" rows, picked by
-  //     whether template_name contains the word "display" anywhere.
-  if (normProject === 'pges') {
-    if (normTask === 'voting_engine' || normTask === 'voting') {
-      return undefined; // caller falls back to the main Denominator Sheet
-    }
-    if (normTask === 'validation') {
-      const repairKey = normTemplate.includes('display')
-        ? `${normProject}||repair only||repair only`
-        : `${normProject}||repair & attribute||repair & attribute`;
-      return ufData.map[repairKey];
-    }
-    return undefined;
+  // Projects with their own "Repair Only" / "Repair & Attribute" rows
+  // (e.g. pges) don't use the voting/validation grouping at all - the
+  // denominator depends only on whether template_name is "display".
+  if (ufData.repairProjects.has(normProject)) {
+    const repairKey = normTemplate === 'display'
+      ? `${normProject}||repair only||repair only`
+      : `${normProject}||repair & attribute||repair & attribute`;
+    if (ufData.map[repairKey] !== undefined) return ufData.map[repairKey];
   }
 
-  // Other UF projects: voting & offline_voting are treated as the same
-  // task; likewise offline_validation & validation.
+  // voting & offline_voting are treated as the same task; likewise
+  // offline_validation & validation.
+  const normTask = normKey(taskName);
   let group = null;
   if (normTask === 'voting' || normTask === 'offline_voting') group = 'voting';
   else if (normTask === 'validation' || normTask === 'offline_validation') group = 'validation';
