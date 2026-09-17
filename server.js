@@ -395,8 +395,60 @@ async function saveToFirebase(firebasePath, payload) {
 |--------------------------------------------------------------------------
 | DENOMINATOR LOOKUP (normalized keys - lowercase + trimmed)
 |--------------------------------------------------------------------------
+| The published "Denominator Sheet" CSV (gid 822634964) actually contains
+| TWO independent tables side by side:
+|
+|   Table 1 "Denominator Sheet"  -> columns A:Y  (Project + task-name grid)
+|   Table 2 "UF Denominator"     -> columns AA:AD (Project, Task, Sub Task, Denominator)
+|
+| They are NOT row-aligned - row N of table 1 and row N of table 2 belong
+| to completely different projects, they just happen to sit on the same
+| CSV line. Row 1 of the CSV is a merged title row ("Denominator Sheet" /
+| "UF Denominator ") - the REAL column headers are on row 2, and data
+| starts on row 3.
+|--------------------------------------------------------------------------
 */
 const normKey = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+
+// Projects that should primarily resolve their denominator from the UF
+// Denominator table's "Menu" rows before falling back to the main matrix /
+// hardcoded fallback.
+const UF_PRIORITY_PROJECTS = new Set([
+  'diageopl', 'diageoes', 'diageopebac', 'diageoromania', 'aneuae',
+  'rjreynoldsus', 'diageomx', 'diageobenelux', 'diageoga', 'diageoza',
+  'diageoug', 'diageoca', 'diageouk', 'diageoit', 'diageoco', 'diageotz',
+  'frucorau', 'diageogr', 'diageoin', 'diageoie', 'diageoar', 'diageoke',
+  'diageostr', 'diageogtr'
+].map(normKey));
+
+// When matching against the UF Denominator table, voting/offline_voting are
+// treated as the same task, and validation/offline_validation are treated
+// as the same task.
+const TASK_EQUIV_GROUPS = {
+  voting: ['voting', 'offline_voting'],
+  offline_voting: ['voting', 'offline_voting'],
+  validation: ['validation', 'offline_validation'],
+  offline_validation: ['validation', 'offline_validation'],
+};
+
+function taskEquivalents(task) {
+  const t = normKey(task);
+  return TASK_EQUIV_GROUPS[t] || [t];
+}
+
+function ufKey(project, task, subtask) {
+  return `${normKey(project)}||${normKey(task)}||${normKey(subtask)}`;
+}
+
+// Column headers that appear in the main "Denominator Sheet" table's header
+// row but are NOT task columns (they end the task-column range).
+const NON_TASK_HEADERS = new Set(['vlookup', 'region']);
+
+// Fixed column offsets of the UF Denominator table (columns AA:AD).
+const UF_COL_PROJECT = 26;
+const UF_COL_TASK = 27;
+const UF_COL_SUBTASK = 28;
+const UF_COL_DENOMINATOR = 29;
 
 let denominatorCache = {
   data: null,
@@ -413,58 +465,34 @@ async function fetchDenominatorSheet() {
     });
 
     const lines = response.data.split(/\r?\n/).filter(l => l.trim().length > 0);
-    const emptyResult = {
-      byProjectTask: {}, byGID: {}, rows: [],
-      uf: { map: {}, projects: new Set(), repairProjects: new Set(), rows: [] }
-    };
-    if (lines.length < 2) return emptyResult;
+    // Row 1 (index 0) is the merged title row ("Denominator Sheet" / "UF
+    // Denominator "), row 2 (index 1) has the real column headers, data
+    // starts at row 3 (index 2).
+    if (lines.length < 3) return { byProjectTask: {}, byGID: {}, rows: [], uf: {} };
 
     const splitLine = (line) =>
       line.split(',').map(cell => cell.trim().replace(/^"|"$/g, ''));
 
-    // The sheet now has a title row ("Denominator Sheet ... UF Denominator")
-    // above the real header row, so find the row that actually starts with
-    // "Project" instead of blindly trusting lines[0].
-    let headerLineIndex = lines.findIndex(l => {
-      const firstCell = l.split(',')[0].trim().replace(/^"|"$/g, '');
-      return firstCell.toLowerCase() === 'project';
-    });
-    if (headerLineIndex === -1) headerLineIndex = 0;
+    const headerCells = splitLine(lines[1]);
 
-    const headerCells = splitLine(lines[headerLineIndex]);
-    const headerCellsLower = headerCells.map(h => h.toLowerCase());
-    const taskNames = headerCells.slice(1).map(h => normKey(h));
-
-    // Main "Denominator Sheet" matrix only spans up to the Region column -
-    // everything past that (gap column + the second "UF Denominator" table)
-    // must NOT be treated as extra task columns.
-    let regionIdx = headerCellsLower.indexOf('region');
-    if (regionIdx === -1) regionIdx = headerCells.length - 1;
-
-    // Locate the second table's columns (Project / Task / Sub Task /
-    // Denominator / UF Denominator reference list) by their header text,
-    // searching only after the main matrix ends.
-    let ufTaskIdx = -1;
-    for (let k = regionIdx + 1; k < headerCellsLower.length; k++) {
-      if (headerCellsLower[k] === 'task') { ufTaskIdx = k; break; }
+    // Find where the main table's task columns end (first blank header,
+    // or a known non-task header like VLOOKUP/Region).
+    let mainTableEnd = headerCells.length;
+    for (let c = 1; c < headerCells.length; c++) {
+      const h = normKey(headerCells[c]);
+      if (!h || NON_TASK_HEADERS.has(h)) { mainTableEnd = c; break; }
     }
-    const ufProjectIdx = ufTaskIdx !== -1 ? ufTaskIdx - 1 : -1;
-    const ufSubtaskIdx = ufTaskIdx !== -1 ? ufTaskIdx + 1 : -1;
-    const ufDenomIdx   = ufTaskIdx !== -1 ? ufTaskIdx + 2 : -1;
-    const ufListIdx    = ufTaskIdx !== -1 ? ufTaskIdx + 3 : -1;
+    const taskNames = headerCells.slice(1, mainTableEnd).map(h => normKey(h));
 
-    const denominatorMap = {
-      byProjectTask: {}, byGID: {}, rows: [],
-      uf: { map: {}, projects: new Set(), repairProjects: new Set(), rows: [] }
-    };
+    const denominatorMap = { byProjectTask: {}, byGID: {}, rows: [], uf: {} };
 
-    for (let i = headerLineIndex + 1; i < lines.length; i++) {
+    for (let i = 2; i < lines.length; i++) {
       const cells = splitLine(lines[i]);
-      const project = normKey(cells[0] || '');
 
-      // --- Main Denominator Sheet matrix (bounded to the Region column) ---
+      // ---- Table 1: "Denominator Sheet" (project x task grid) ----
+      const project = normKey(cells[0] || '');
       if (project) {
-        for (let j = 1; j <= regionIdx && j < cells.length; j++) {
+        for (let j = 1; j <= taskNames.length; j++) {
           const taskName = taskNames[j - 1];
           if (!taskName) continue;
           const raw = (cells[j] || '').trim();
@@ -477,43 +505,24 @@ async function fetchDenominatorSheet() {
         }
       }
 
-      // --- Second "UF Denominator" table (Project / Task / Sub Task / Denominator) ---
-      if (ufTaskIdx !== -1) {
-        const ufProject = normKey(cells[ufProjectIdx] || '');
-        const ufTask    = normKey(cells[ufTaskIdx] || '');
-        const ufSubtask = normKey(cells[ufSubtaskIdx] || '');
-        const ufRaw     = (cells[ufDenomIdx] || '').trim();
-
-        if (ufProject && ufTask && ufSubtask && ufRaw && ufRaw !== '-') {
-          const ufDenominator = parseFloat(ufRaw);
-          if (!isNaN(ufDenominator)) {
-            const ufKey = `${ufProject}||${ufTask}||${ufSubtask}`;
-            denominatorMap.uf.map[ufKey] = ufDenominator;
-            denominatorMap.uf.rows.push({ project: ufProject, task: ufTask, subtask: ufSubtask, denominator: ufDenominator });
-            if (ufTask === 'repair only' || ufTask === 'repair & attribute') {
-              denominatorMap.uf.repairProjects.add(ufProject);
-            }
-          }
-        }
-
-        // Reference list of projects that should use this UF table at all
-        // (skip the stray "Project" sub-header that lands in the first data row).
-        const ufListRaw = normKey(cells[ufListIdx] || '');
-        if (ufListRaw && ufListRaw !== 'project') {
-          denominatorMap.uf.projects.add(ufListRaw);
+      // ---- Table 2: "UF Denominator" (independent long-format table) ----
+      const ufProject = (cells[UF_COL_PROJECT] || '').trim();
+      const ufTask = (cells[UF_COL_TASK] || '').trim();
+      const ufSubtask = (cells[UF_COL_SUBTASK] || '').trim();
+      const ufDenomRaw = (cells[UF_COL_DENOMINATOR] || '').trim();
+      if (ufProject && ufTask && ufSubtask && ufDenomRaw && ufDenomRaw !== '-') {
+        const ufDenominator = parseFloat(ufDenomRaw);
+        if (!isNaN(ufDenominator)) {
+          denominatorMap.uf[ufKey(ufProject, ufTask, ufSubtask)] = ufDenominator;
         }
       }
     }
 
-    console.log(`✅ Loaded ${Object.keys(denominatorMap.byProjectTask).length} project/task denominators from matrix`);
-    console.log(`✅ Loaded ${Object.keys(denominatorMap.uf.map).length} UF denominators for ${denominatorMap.uf.projects.size} UF project(s)`);
+    console.log(`✅ Loaded ${Object.keys(denominatorMap.byProjectTask).length} project/task denominators, ${Object.keys(denominatorMap.uf).length} UF denominator rows`);
     return denominatorMap;
   } catch (err) {
     console.error("❌ Failed to fetch denominator sheet:", err.message);
-    return {
-      byProjectTask: {}, byGID: {}, rows: [],
-      uf: { map: {}, projects: new Set(), repairProjects: new Set(), rows: [] }
-    };
+    return { byProjectTask: {}, byGID: {}, rows: [], uf: {} };
   }
 }
 
@@ -556,71 +565,36 @@ function taskFallback(normTask) {
   return 0;
 }
 
-// Looks up a denominator from the second "UF Denominator" table for
-// projects listed there. Returns undefined if the project isn't a UF
-// project or no matching row exists (caller then falls back to the main
-// Denominator Sheet matrix).
-function lookupUFDenominator(project, taskName, templateName, ufData) {
-  const normProject = normKey(project);
-  if (!ufData.projects.has(normProject)) return undefined;
-
-  const normTemplate = normKey(templateName);
-  const normTask = normKey(taskName);
-
-  // "pges" has its own dedicated rules that override the generic
-  // voting/validation grouping below:
-  //   - task_name voting_engine / voting  -> denominator comes from the
-  //     MAIN Denominator Sheet (first table), not from this UF table.
-  //   - task_name validation              -> denominator comes from this
-  //     UF table's "Repair Only" / "Repair & Attribute" rows, picked by
-  //     whether template_name contains the word "display" anywhere.
-  if (normProject === 'pges') {
-    if (normTask === 'voting_engine' || normTask === 'voting') {
-      return undefined; // caller falls back to the main Denominator Sheet
-    }
-    if (normTask === 'validation') {
-      const repairKey = normTemplate.includes('display')
-        ? `${normProject}||repair only||repair only`
-        : `${normProject}||repair & attribute||repair & attribute`;
-      return ufData.map[repairKey];
-    }
-    return undefined;
+// Looks up a single UF Denominator table entry, trying every task
+// equivalent (voting<->offline_voting, validation<->offline_validation)
+// against the given subtask ("Menu", "Repair Only", "Repair & Attribute", ...).
+function lookupUFDenominator(project, task, subtask, ufMap) {
+  for (const t of taskEquivalents(task)) {
+    const key = ufKey(project, t, subtask);
+    if (ufMap[key] !== undefined) return ufMap[key];
   }
-
-  // Other UF projects: voting & offline_voting are treated as the same
-  // task; likewise offline_validation & validation.
-  let group = null;
-  if (normTask === 'voting' || normTask === 'offline_voting') group = 'voting';
-  else if (normTask === 'validation' || normTask === 'offline_validation') group = 'validation';
-
-  if (group) {
-    const menuTask     = group === 'voting' ? 'offline_voting' : 'offline_validation';
-    const detailTask   = group; // 'voting' or 'validation'
-    const detailSubtask = group === 'voting' ? 'offline_voting' : 'offline_validation';
-
-    // template_name = "menu" -> the Menu sub-task row; anything else -> the
-    // detail (offline_*) sub-task row.
-    const key = normTemplate === 'menu'
-      ? `${normProject}||${menuTask}||menu`
-      : `${normProject}||${detailTask}||${detailSubtask}`;
-
-    if (ufData.map[key] !== undefined) return ufData.map[key];
-  }
-
-  // Fallback: a direct project+task match where the sub-task mirrors the
-  // task itself (e.g. offline_posm||offline_posm).
-  const directKey = `${normProject}||${normTask}||${normTask}`;
-  if (ufData.map[directKey] !== undefined) return ufData.map[directKey];
-
   return undefined;
 }
 
-function lookupDenominator(project, task, templateName, denominatorData) {
-  const ufDenominator = lookupUFDenominator(project, task, templateName, denominatorData.uf);
-  if (ufDenominator !== undefined) return ufDenominator;
-
-  const normTask    = normKey(task);
+function lookupDenominator(project, task, denominatorData, templateName) {
   const normProject = normKey(project);
+  const normTask    = normKey(task);
+  const ufMap = denominatorData.uf || {};
+
+  // Special case: PGES resolves its denominator from the UF table using
+  // "Repair Only" when the row's own template_name is "display", and
+  // "Repair & Attribute" for every other template_name.
+  if (normProject === 'pges') {
+    const subtask = normKey(templateName) === 'display' ? 'Repair Only' : 'Repair & Attribute';
+    const ufValue = lookupUFDenominator(normProject, normTask, subtask, ufMap);
+    if (ufValue !== undefined) return ufValue;
+  } else if (UF_PRIORITY_PROJECTS.has(normProject)) {
+    // Priority projects: primarily resolve from the UF table's "Menu" rows.
+    const ufValue = lookupUFDenominator(normProject, normTask, 'menu', ufMap);
+    if (ufValue !== undefined) return ufValue;
+  }
+
+  // Fallback: main "Denominator Sheet" matrix, then the hardcoded fallback.
   const exactKey = `${normProject}||${normTask}`;
   if (denominatorData.byProjectTask[exactKey] !== undefined) {
     return denominatorData.byProjectTask[exactKey];
@@ -631,7 +605,7 @@ function lookupDenominator(project, task, templateName, denominatorData) {
 async function enrichWithDenominator(rows) {
   const denominatorData = await getDenominatorData();
   return rows.map(row => {
-    const denominator = lookupDenominator(row.project_name, row.task_name, row.template_name, denominatorData);
+    const denominator = lookupDenominator(row.project_name, row.task_name, denominatorData, row.template_name);
     const wd = row.value * denominator;
     return { ...row, denominator, wd, count: row.value };
   });
@@ -1012,7 +986,8 @@ const server = http.createServer(async (req, res) => {
           data,
           count: {
             byProjectTask: Object.keys(data.byProjectTask).length,
-            byGID: Object.keys(data.byGID).length
+            byGID: Object.keys(data.byGID).length,
+            uf: Object.keys(data.uf || {}).length
           }
         }));
       } catch (err) {
