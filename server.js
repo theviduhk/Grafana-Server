@@ -380,12 +380,15 @@ function processResults(result) {
       //    Repair & Attribute decide karanna
       //  - UF_PRIORITY_PROJECTS walatath (task eka monawa unath) - Menu
       //    vs offline_posm decide karanna
+      //  - GSKTW walatath (task eka monawa unath) - UF Denominator table
+      //    eke Sub Task eka template_name ekatama direct match karanna
       // Meka nathnam lookupDenominator ekata templateName ehema undefined
       // widihata yanawa, e nisa "menu"/"posm" substring check eka never
       // trigger wenne nathi.
       const isPges = normKeySimple(obj.project_name) === 'pges';
       const isUFPriority = UF_PRIORITY_PROJECTS.has(normKeySimple(obj.project_name));
-      if ((isTemplateNameTask(obj.task_name) || isPges || isUFPriority) && obj.template_name) {
+      const isGsktw = normKeySimple(obj.project_name) === 'gsktw';
+      if ((isTemplateNameTask(obj.task_name) || isPges || isUFPriority || isGsktw) && obj.template_name) {
         row.template_name = obj.template_name;
       }
       return row;
@@ -616,8 +619,9 @@ function findUFDenominator(project, task, ufRowsByProject) {
 }
 
 // Finds a UF Denominator table row for (project, task, subtask) - used for
-// PGES's "Repair Only" / "Repair & Attribute" rows - where task equivalence
-// still applies (exact task match preferred over an equivalent-task match).
+// PGES's "Repair Only" / "Repair & Attribute" rows, and for GSKTW's direct
+// task+template_name match - where task equivalence still applies (exact
+// task match preferred over an equivalent-task match).
 function findUFDenominatorBySubtask(project, task, subtask, ufRowsByProject) {
   const rows = ufRowsByProject[normKey(project)];
   if (!rows || !rows.length) return undefined;
@@ -670,6 +674,12 @@ function lookupDenominator(project, task, denominatorData, templateName) {
     // "Repair & Attribute".
     const subtask = normKey(templateName).includes('display') ? 'Repair Only' : 'Repair & Attribute';
     const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
+    if (ufValue !== undefined) return ufValue;
+  } else if (normProject === 'gsktw') {
+    // GSKTW: UF Denominator table eken task_name eka Task ekatath,
+    // template_name eka NAME EKATAMA (menu/posm substring check ekak
+    // nathuwa) Sub Task ekatath direct match wena row eka gannawa.
+    const ufValue = findUFDenominatorBySubtask(normProject, normTask, templateName, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   } else if (UF_PRIORITY_PROJECTS.has(normProject)) {
     // Priority projects: if template_name has "menu" or "posm" anywhere
