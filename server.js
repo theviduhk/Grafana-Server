@@ -635,6 +635,27 @@ function findUFDenominatorBySubtask(project, task, subtask, ufRowsByProject) {
   return exact !== undefined ? exact : equiv;
 }
 
+// Finds a UF Denominator table row whose Sub Task column is itself a
+// task-like value (e.g. "offline_voting", "voting", "validation",
+// "offline_validation") that matches the row's own task - used as the
+// no-"menu"-in-template_name fallback for UF_PRIORITY_PROJECTS. Task
+// equivalence still applies (exact match on Sub Task preferred over an
+// equivalent-task Sub Task match).
+function findUFDenominatorByTaskAsSubtask(project, task, ufRowsByProject) {
+  const rows = ufRowsByProject[normKey(project)];
+  if (!rows || !rows.length) return undefined;
+
+  const normTask = normKey(task);
+  const equivSet = new Set(taskEquivalents(task));
+
+  let exact, equiv;
+  for (const r of rows) {
+    if (r.subtask === normTask) exact = r.denominator;
+    else if (equivSet.has(r.subtask) && equiv === undefined) equiv = r.denominator;
+  }
+  return exact !== undefined ? exact : equiv;
+}
+
 function lookupDenominator(project, task, denominatorData, templateName) {
   const normProject = normKey(project);
   const normTask    = normKey(task);
@@ -662,6 +683,13 @@ function lookupDenominator(project, task, denominatorData, templateName) {
     if (uiSubtask) {
       const ufSubtaskValue = findUFDenominatorBySubtask(normProject, normTask, uiSubtask, ufRowsByProject);
       if (ufSubtaskValue !== undefined) return ufSubtaskValue;
+    } else {
+      // No "menu"/"posm" in template_name: resolve the Sub Task by
+      // matching the task itself (e.g. Sub Task = "offline_voting",
+      // "voting", "validation", "offline_validation"), not by preferring
+      // a "Menu" row.
+      const taskSubtaskValue = findUFDenominatorByTaskAsSubtask(normProject, normTask, ufRowsByProject);
+      if (taskSubtaskValue !== undefined) return taskSubtaskValue;
     }
 
     // Fallback (no menu/posm in template_name, or no matching UF row found):
