@@ -468,7 +468,7 @@ async function fetchDenominatorSheet() {
     // Row 1 (index 0) is the merged title row ("Denominator Sheet" / "UF
     // Denominator "), row 2 (index 1) has the real column headers, data
     // starts at row 3 (index 2).
-    if (lines.length < 3) return { byProjectTask: {}, byGID: {}, rows: [], uf: {} };
+    if (lines.length < 3) return { byProjectTask: {}, byGID: {}, rows: [], uf: {}, ufRowsByProject: {} };
 
     const splitLine = (line) =>
       line.split(',').map(cell => cell.trim().replace(/^"|"$/g, ''));
@@ -484,7 +484,7 @@ async function fetchDenominatorSheet() {
     }
     const taskNames = headerCells.slice(1, mainTableEnd).map(h => normKey(h));
 
-    const denominatorMap = { byProjectTask: {}, byGID: {}, rows: [], uf: {} };
+    const denominatorMap = { byProjectTask: {}, byGID: {}, rows: [], uf: {}, ufRowsByProject: {} };
 
     for (let i = 2; i < lines.length; i++) {
       const cells = splitLine(lines[i]);
@@ -513,7 +513,12 @@ async function fetchDenominatorSheet() {
       if (ufProject && ufTask && ufSubtask && ufDenomRaw && ufDenomRaw !== '-') {
         const ufDenominator = parseFloat(ufDenomRaw);
         if (!isNaN(ufDenominator)) {
+          const nProject = normKey(ufProject);
+          const nTask = normKey(ufTask);
+          const nSubtask = normKey(ufSubtask);
           denominatorMap.uf[ufKey(ufProject, ufTask, ufSubtask)] = ufDenominator;
+          if (!denominatorMap.ufRowsByProject[nProject]) denominatorMap.ufRowsByProject[nProject] = [];
+          denominatorMap.ufRowsByProject[nProject].push({ task: nTask, subtask: nSubtask, denominator: ufDenominator });
         }
       }
     }
@@ -522,7 +527,7 @@ async function fetchDenominatorSheet() {
     return denominatorMap;
   } catch (err) {
     console.error("❌ Failed to fetch denominator sheet:", err.message);
-    return { byProjectTask: {}, byGID: {}, rows: [], uf: {} };
+    return { byProjectTask: {}, byGID: {}, rows: [], uf: {}, ufRowsByProject: {} };
   }
 }
 
@@ -565,32 +570,76 @@ function taskFallback(normTask) {
   return 0;
 }
 
-// Looks up a single UF Denominator table entry, trying every task
-// equivalent (voting<->offline_voting, validation<->offline_validation)
-// against the given subtask ("Menu", "Repair Only", "Repair & Attribute", ...).
-function lookupUFDenominator(project, task, subtask, ufMap) {
-  for (const t of taskEquivalents(task)) {
-    const key = ufKey(project, t, subtask);
-    if (ufMap[key] !== undefined) return ufMap[key];
+// Finds the best UF Denominator table row for (project, task), where task
+// equivalence (voting<->offline_voting, validation<->offline_validation)
+// applies across the WHOLE UF table for that project - not just "Menu"
+// rows. An exact task match always wins over an equivalent-task match, and
+// a "Menu" subtask row always wins over any other subtask, so:
+//   1. exact task, subtask = Menu
+//   2. exact task, any other subtask   (e.g. offline_voting -> offline_voting)
+//   3. equivalent task, subtask = Menu
+//   4. equivalent task, any other subtask
+function findUFDenominator(project, task, ufRowsByProject) {
+  const rows = ufRowsByProject[normKey(project)];
+  if (!rows || !rows.length) return undefined;
+
+  const normTask = normKey(task);
+  const equivSet = new Set(taskEquivalents(task));
+
+  let exactMenu, exactAny, equivMenu, equivAny;
+  for (const r of rows) {
+    if (r.task === normTask) {
+      if (r.subtask === 'menu') exactMenu = r.denominator;
+      else if (exactAny === undefined) exactAny = r.denominator;
+    } else if (equivSet.has(r.task)) {
+      if (r.subtask === 'menu') equivMenu = r.denominator;
+      else if (equivAny === undefined) equivAny = r.denominator;
+    }
   }
+  if (exactMenu !== undefined) return exactMenu;
+  if (exactAny !== undefined) return exactAny;
+  if (equivMenu !== undefined) return equivMenu;
+  if (equivAny !== undefined) return equivAny;
   return undefined;
+}
+
+// Finds a UF Denominator table row for (project, task, subtask) - used for
+// PGES's "Repair Only" / "Repair & Attribute" rows - where task equivalence
+// still applies (exact task match preferred over an equivalent-task match).
+function findUFDenominatorBySubtask(project, task, subtask, ufRowsByProject) {
+  const rows = ufRowsByProject[normKey(project)];
+  if (!rows || !rows.length) return undefined;
+
+  const normTask = normKey(task);
+  const normSubtask = normKey(subtask);
+  const equivSet = new Set(taskEquivalents(task));
+
+  let exact, equiv;
+  for (const r of rows) {
+    if (r.subtask !== normSubtask) continue;
+    if (r.task === normTask) exact = r.denominator;
+    else if (equivSet.has(r.task) && equiv === undefined) equiv = r.denominator;
+  }
+  return exact !== undefined ? exact : equiv;
 }
 
 function lookupDenominator(project, task, denominatorData, templateName) {
   const normProject = normKey(project);
   const normTask    = normKey(task);
-  const ufMap = denominatorData.uf || {};
+  const ufRowsByProject = denominatorData.ufRowsByProject || {};
 
   // Special case: PGES resolves its denominator from the UF table using
   // "Repair Only" when the row's own template_name is "display", and
   // "Repair & Attribute" for every other template_name.
   if (normProject === 'pges') {
     const subtask = normKey(templateName) === 'display' ? 'Repair Only' : 'Repair & Attribute';
-    const ufValue = lookupUFDenominator(normProject, normTask, subtask, ufMap);
+    const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   } else if (UF_PRIORITY_PROJECTS.has(normProject)) {
-    // Priority projects: primarily resolve from the UF table's "Menu" rows.
-    const ufValue = lookupUFDenominator(normProject, normTask, 'menu', ufMap);
+    // Priority projects: primarily resolve from the UF Denominator table,
+    // treating voting/offline_voting and validation/offline_validation as
+    // the same task when searching it.
+    const ufValue = findUFDenominator(normProject, normTask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   }
 
