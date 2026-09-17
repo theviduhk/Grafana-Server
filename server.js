@@ -375,15 +375,17 @@ function processResults(result) {
         value: Number(obj.value || 0),
       };
       // template_name eka row ekata attach karanne "voting/validation"
-      // vage TEMPLATE_NAME_TASKS walata witharak neme - PGES walatath
-      // (task eka monawa unath) denominator lookup eka (Repair Only vs
-      // Repair & Attribute) template_name uda depend wena nisa eka
-      // danna oni. Meka nathnam lookupDenominator ekata templateName
-      // ehema undefined widihata yanawa, e nisa PGES ta hamadama
-      // "Repair & Attribute" witharak select wela "Repair Only" (Display)
-      // case eka never trigger wenne nathi.
+      // vage TEMPLATE_NAME_TASKS walata witharak neme:
+      //  - PGES walatath (task eka monawa unath) - Repair Only vs
+      //    Repair & Attribute decide karanna
+      //  - UF_PRIORITY_PROJECTS walatath (task eka monawa unath) - Menu
+      //    vs offline_posm decide karanna
+      // Meka nathnam lookupDenominator ekata templateName ehema undefined
+      // widihata yanawa, e nisa "menu"/"posm" substring check eka never
+      // trigger wenne nathi.
       const isPges = normKeySimple(obj.project_name) === 'pges';
-      if ((isTemplateNameTask(obj.task_name) || isPges) && obj.template_name) {
+      const isUFPriority = UF_PRIORITY_PROJECTS.has(normKeySimple(obj.project_name));
+      if ((isTemplateNameTask(obj.task_name) || isPges || isUFPriority) && obj.template_name) {
         row.template_name = obj.template_name;
       }
       return row;
@@ -423,6 +425,7 @@ const normKey = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
 // Denominator table's "Menu" rows before falling back to the main matrix /
 // hardcoded fallback.
 const UF_PRIORITY_PROJECTS = new Set([
+  'batru',
   'diageopl', 'diageoes', 'diageopebac', 'diageoromania', 'aneuae',
   'rjreynoldsus', 'diageomx', 'diageobenelux', 'diageoga', 'diageoza',
   'diageoug', 'diageoca', 'diageouk', 'diageoit', 'diageoco', 'diageotz',
@@ -648,9 +651,23 @@ function lookupDenominator(project, task, denominatorData, templateName) {
     const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   } else if (UF_PRIORITY_PROJECTS.has(normProject)) {
-    // Priority projects: primarily resolve from the UF Denominator table,
-    // treating voting/offline_voting and validation/offline_validation as
-    // the same task when searching it.
+    // Priority projects: if template_name has "menu" or "posm" anywhere
+    // in it (substring, not exact match), pull the UF Denominator row for
+    // that specific Sub Task ("Menu" / "offline_posm") directly.
+    const tName = normKey(templateName);
+    let uiSubtask = null;
+    if (tName.includes('menu')) uiSubtask = 'Menu';
+    else if (tName.includes('posm')) uiSubtask = 'offline_posm';
+
+    if (uiSubtask) {
+      const ufSubtaskValue = findUFDenominatorBySubtask(normProject, normTask, uiSubtask, ufRowsByProject);
+      if (ufSubtaskValue !== undefined) return ufSubtaskValue;
+    }
+
+    // Fallback (no menu/posm in template_name, or no matching UF row found):
+    // resolve from the UF Denominator table the original way, treating
+    // voting/offline_voting and validation/offline_validation as the same
+    // task when searching it.
     const ufValue = findUFDenominator(normProject, normTask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   }
