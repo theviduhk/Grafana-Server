@@ -137,8 +137,8 @@ let loginPromise = null;
 async function loginToGrafana() {
   console.log("🔐 Logging into Grafana to get fresh session...");
 
-  const username = "gss.kurunegala@gssintl.biz";
-  const password = "Gssk@2021";
+  const username = "gss.colombo@gssintl.biz";
+  const password = "GSS_TraxForm@2026";
 
   try {
     const response = await axios.post(
