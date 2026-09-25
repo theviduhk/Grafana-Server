@@ -10,6 +10,7 @@ const url = require("url");
 |   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
 |   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
 |   3. Project + Task filtered fetch             -> /qat_filtered.json
+|   4. Planning (project + task + target, multi) -> /planning.json
 |
 | Sema fetch mode 3ma dæn OPTIONAL `date=YYYY-MM-DD` query param eka
 | support karanawa. Date eka denne nathnam (allathwa waradi format eka
@@ -28,6 +29,7 @@ const FIREBASE_URL = "https://qat-output-default-rtdb.firebaseio.com";
 const FIREBASE_PATH_TL       = "/TL Hourly.json";     // Team Leader mode
 const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
 const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
+const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning (multi project+task+target) mode
 
 // Render port config (Render PORT env eken automatic set wenawa)
 const PORT = process.env.PORT || 3000;
@@ -394,12 +396,22 @@ function processResults(result) {
 
 /*
 |--------------------------------------------------------------------------
-| FIREBASE SAVE (path parameter eken kaka data save karanawada kiyala decide karanawa)
+| FIREBASE SAVE / READ (path parameter eken kaka data save/read karanawada kiyala decide karanawa)
 |--------------------------------------------------------------------------
 */
 async function saveToFirebase(firebasePath, payload) {
   await axios.put(`${FIREBASE_URL}${firebasePath}`, payload);
   console.log(`  🔥 Firebase updated at "${firebasePath}"`);
+}
+
+async function getFromFirebase(firebasePath) {
+  try {
+    const res = await axios.get(`${FIREBASE_URL}${firebasePath}`);
+    return res.data || null;
+  } catch (err) {
+    console.error(`  🔥 Firebase read error (${firebasePath}):`, err.message);
+    return null;
+  }
 }
 
 /*
@@ -808,6 +820,56 @@ async function fetchFilteredByProjectTask(project, task, dateStr) {
 
 /*
 |--------------------------------------------------------------------------
+| FETCH — MODE 4: Planning (multiple project+task+target combos)
+|--------------------------------------------------------------------------
+| Planning entries are stored in Firebase at /planning.json, keyed by an
+| auto-generated id:
+|   { [id]: { project_name, task_name, target, actual, percentage, ... } }
+|
+| refreshAllPlanning() walks every entry, re-fetches "actual" (sum of
+| `value` for that project+task, reusing MODE 3's query/processing, no
+| denominator enrichment) and writes the whole map back to Firebase.
+|--------------------------------------------------------------------------
+*/
+async function fetchPlanningActual(entry, dateStr) {
+  const rows = await fetchFilteredByProjectTask(entry.project_name, entry.task_name, dateStr);
+  const actual = rows.reduce((sum, r) => sum + (Number(r.value) || 0), 0);
+  const target = Number(entry.target) || 0;
+  const percentage = target > 0 ? Math.round((actual / target) * 1000) / 10 : 0;
+  return { actual, percentage };
+}
+
+async function refreshAllPlanning(dateStr) {
+  const planningMap = (await getFromFirebase(FIREBASE_PATH_PLANNING)) || {};
+  const ids = Object.keys(planningMap);
+  console.log(`\n>>> [PLANNING] Refreshing ${ids.length} planning item(s)... date="${dateStr || 'today'}"`);
+
+  const updated = {};
+  await Promise.all(
+    ids.map(async (id) => {
+      const entry = planningMap[id] || {};
+      try {
+        const { actual, percentage } = await fetchPlanningActual(entry, dateStr);
+        updated[id] = {
+          ...entry,
+          actual,
+          percentage,
+          date: dateStr || "today",
+          last_fetched_at: new Date().toISOString(),
+        };
+      } catch (err) {
+        console.error(`  Error refreshing planning id=${id}:`, err.message);
+        updated[id] = { ...entry, error: err.message, last_fetched_at: new Date().toISOString() };
+      }
+    })
+  );
+
+  await saveToFirebase(FIREBASE_PATH_PLANNING, updated);
+  return updated;
+}
+
+/*
+|--------------------------------------------------------------------------
 | STAFF LOOKUP
 |--------------------------------------------------------------------------
 */
@@ -873,6 +935,29 @@ function parseIdsParam(query) {
   return String(raw).split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// Reads and JSON-parses a request body (used by POST /planning).
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1e6) {
+        req.destroy();
+        reject(new Error("Payload too large"));
+      }
+    });
+    req.on("end", () => {
+      if (!body) return resolve({});
+      try {
+        resolve(JSON.parse(body));
+      } catch (err) {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 /*
 |--------------------------------------------------------------------------
 | HTTP SERVER WITH CORS
@@ -914,7 +999,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning)",
         time: new Date().toISOString(),
         cors: "enabled"
       }));
@@ -1061,6 +1146,89 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // -------------------------------------------------------------
+    // MODE 4: PLANNING — pick several project+task combos, give each a
+    // target, and track actual-vs-target. All entries live under Firebase
+    // /planning.json.
+    // -------------------------------------------------------------
+
+    // GET /planning  -> list every planning entry
+    if (pathname === "/planning" && req.method === "GET") {
+      const planningMap = (await getFromFirebase(FIREBASE_PATH_PLANNING)) || {};
+      const list = Object.entries(planningMap).map(([id, entry]) => ({ id, ...entry }));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, data: list, count: list.length }));
+      return;
+    }
+
+    // POST /planning  -> add a new { project_name, task_name, target } entry
+    if (pathname === "/planning" && req.method === "POST") {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+
+      const project_name = String(body.project_name || "").trim();
+      const task_name = String(body.task_name || "").trim();
+      const target = Number(body.target);
+
+      if (!project_name || !task_name || !Number.isFinite(target) || target < 0) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "project_name, task_name, target (>= 0) required" }));
+        return;
+      }
+
+      const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const entry = {
+        project_name,
+        task_name,
+        target,
+        actual: 0,
+        percentage: 0,
+        created_at: new Date().toISOString(),
+      };
+      await axios.put(`${FIREBASE_URL}/planning/${id}.json`, entry);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, id, data: entry }));
+      return;
+    }
+
+    // DELETE /planning?id=xxx  -> remove a planning entry
+    if (pathname === "/planning" && req.method === "DELETE") {
+      const id = String(query.id || "").trim();
+      if (!id) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "id required" }));
+        return;
+      }
+      await axios.delete(`${FIREBASE_URL}/planning/${id}.json`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, id }));
+      return;
+    }
+
+    // GET /planning-fetch?date=YYYY-MM-DD  -> refresh "actual" for every
+    // planning entry (queries BigQuery per project+task) and saves back to
+    // Firebase /planning.json
+    if (pathname === "/planning-fetch" && req.method === "GET") {
+      const dateStr = parseDateParam(query);
+      const updated = await refreshAllPlanning(dateStr);
+      const list = Object.entries(updated).map(([id, entry]) => ({ id, ...entry }));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        date: dateStr || "today",
+        data: list,
+        count: list.length,
+        updated_at: new Date().toISOString(),
+      }));
+      return;
+    }
+
     // Staff lookup
     if (pathname === "/staff-lookup" && req.method === "GET") {
       const csv = await fetchStaffLookup();
@@ -1138,6 +1306,7 @@ server.listen(PORT, HOST, () => {
   console.log(`     TL mode      -> ${FIREBASE_PATH_TL}`);
   console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
   console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
+  console.log(`     Planning     -> ${FIREBASE_PATH_PLANNING}`);
   console.log(`  📊 Endpoints (all accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
   console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
@@ -1145,6 +1314,10 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
+  console.log(`    GET  /planning                          - List planning entries`);
+  console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
+  console.log(`    DEL  /planning?id=                      - Remove a planning entry`);
+  console.log(`    GET  /planning-fetch                    - Refresh actual/% for all -> ${FIREBASE_PATH_PLANNING}`);
   console.log(`    GET  /staff-lookup                      - Staff name lookup`);
   console.log(`    GET  /project-task-lookup                - Project/Task lookup`);
   console.log(`    GET  /denominator-lookup                 - Denominator lookup`);
