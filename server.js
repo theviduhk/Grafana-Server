@@ -832,11 +832,13 @@ async function fetchFilteredByProjectTask(project, task, dateStr) {
 |--------------------------------------------------------------------------
 | Planning entries are stored in Firebase at /planning.json, keyed by an
 | auto-generated id:
-|   { [id]: { project_name, task_name, target, actual, percentage, ... } }
+|   { [id]: { project_name, task_name, target, actual, percentage,
+|              staff_breakdown: [{staff_id, value}, ...], ... } }
 |
 | refreshAllPlanning() walks every entry, re-fetches "actual" (sum of
 | `value` for that project+task, reusing MODE 3's query/processing, no
-| denominator enrichment) and writes the whole map back to Firebase.
+| denominator enrichment) plus a staff_id-wise breakdown of that same
+| total, and writes the whole map back to Firebase.
 |--------------------------------------------------------------------------
 */
 async function fetchPlanningActual(entry, dateStr) {
@@ -844,7 +846,19 @@ async function fetchPlanningActual(entry, dateStr) {
   const actual = rows.reduce((sum, r) => sum + (Number(r.value) || 0), 0);
   const target = Number(entry.target) || 0;
   const percentage = target > 0 ? Math.round((actual / target) * 1000) / 10 : 0;
-  return { actual, percentage };
+
+  // Staff-id-wise breakdown: sum `value` per staff_id across all the hourly
+  // rows returned for this project+task, sorted highest contributor first.
+  const staffMap = {};
+  rows.forEach((r) => {
+    const sid = r.staff_id || "unknown";
+    staffMap[sid] = (staffMap[sid] || 0) + (Number(r.value) || 0);
+  });
+  const staff_breakdown = Object.entries(staffMap)
+    .map(([staff_id, value]) => ({ staff_id, value }))
+    .sort((a, b) => b.value - a.value);
+
+  return { actual, percentage, staff_breakdown };
 }
 
 async function refreshAllPlanning(dateStr) {
@@ -857,11 +871,12 @@ async function refreshAllPlanning(dateStr) {
     ids.map(async (id) => {
       const entry = planningMap[id] || {};
       try {
-        const { actual, percentage } = await fetchPlanningActual(entry, dateStr);
+        const { actual, percentage, staff_breakdown } = await fetchPlanningActual(entry, dateStr);
         updated[id] = {
           ...entry,
           actual,
           percentage,
+          staff_breakdown,
           date: dateStr || "today",
           last_fetched_at: new Date().toISOString(),
         };
