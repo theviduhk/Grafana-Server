@@ -1,6 +1,8 @@
 const axios = require("axios");
 const http = require("http");
 const url = require("url");
+const fs = require("fs");
+const path = require("path");
 
 /*
 |--------------------------------------------------------------------------
@@ -30,6 +32,12 @@ const FIREBASE_PATH_TL       = "/TL Hourly.json";     // Team Leader mode
 const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
 const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
 const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning (multi project+task+target) mode
+
+// planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni -
+// eyata "/planning-ui" ekedi serve karanawa, e nisa page eka open unama
+// same-origin fetch() call automatic widihata server ekatama yanawa
+// (server URL/username/password ehema manually danna oni na).
+const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
 
 // Render port config (Render PORT env eken automatic set wenawa)
 const PORT = process.env.PORT || 3000;
@@ -982,7 +990,7 @@ const server = http.createServer(async (req, res) => {
   // Auth credentials (its source server had no auth check at all), so we
   // exempt /fetch-filtered here to match that frontend's existing behaviour.
   // Every other endpoint keeps requiring Basic Auth like before.
-  const AUTH_EXEMPT_PATHS = ["/fetch-filtered"];
+  const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
     res.writeHead(401, {
@@ -1143,6 +1151,21 @@ const server = http.createServer(async (req, res) => {
         task,
         updated_at: new Date().toISOString(),
       }));
+      return;
+    }
+
+    // Planning UI — serves the bundled planning.html tool itself (same
+    // origin as the API, so it needs no manual server URL/credentials).
+    if (pathname === "/planning-ui" && req.method === "GET") {
+      fs.readFile(PLANNING_HTML_PATH, "utf8", (err, html) => {
+        if (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "planning.html not found next to server.js: " + err.message }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+      });
       return;
     }
 
@@ -1314,6 +1337,7 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
+  console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
   console.log(`    GET  /planning                          - List planning entries`);
   console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
   console.log(`    DEL  /planning?id=                      - Remove a planning entry`);
