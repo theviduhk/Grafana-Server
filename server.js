@@ -8,18 +8,17 @@ const path = require("path");
 |--------------------------------------------------------------------------
 | CONFIG
 |--------------------------------------------------------------------------
-| Meka thani server ekakin thanku data 3ma type eka handle karanawa:
+| Meka thani server ekakin thanku data 5ma type eka handle karanawa:
 |   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
 |   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
 |   3. Project + Task filtered fetch             -> /qat_filtered.json
 |   4. Planning (project + task + target, multi) -> /planning.json
+|   5. Project Outflow (project | task | center) -> projectgap Firebase
+|                                                   Firebase /project-gap.json
 |
 | Sema fetch mode 3ma dæn OPTIONAL `date=YYYY-MM-DD` query param eka
 | support karanawa. Date eka denne nathnam (allathwa waradi format eka
-| dunnoth) default eka widihata "today" (CURRENT_TIMESTAMP() up-to-the-
-| minute) query eka run wenawa - meka appearance eken kalin behavior ekama.
-| Past date ekak dunnoth, e dawase pura 24 pæya (00:00:00 sita 23:59:59.999999
-| dakwa) BigQuery walin fetch karanawa.
+| dunnoth) default eka widihata "today" query eka run wenawa.
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -27,16 +26,23 @@ const QUERY_URL =
 
 const FIREBASE_URL = "https://qat-output-default-rtdb.firebaseio.com";
 
-// Wenama Firebase path 3ka - features 3ta anuwa
+// Wenama Firebase path - features anuwa
 const FIREBASE_PATH_TL       = "/TL Hourly.json";     // Team Leader mode
 const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
 const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
-const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning (multi project+task+target) mode
+const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning mode
 
-// planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni -
-// eyata "/planning-ui" ekedi serve karanawa, e nisa page eka open unama
-// same-origin fetch() call automatic widihata server ekatama yanawa
-// (server URL/username/password ehema manually danna oni na).
+// MODE 5 (Outflow) - wenama Firebase database ekak, e nisa full URL eka.
+const FIREBASE_OUTFLOW_URL =
+  "https://projectgap-4b7d9-default-rtdb.firebaseio.com/project-gap.json";
+
+// Outflow data eka background eken auto-refresh wena gaman (seconds).
+// Kalin script eke wage 10s. 0 dunnoth auto-refresh nawathinawa (manual
+// /fetch-outflow call witharak). Render env eken OUTFLOW_INTERVAL_SEC
+// widihata change karanna puluwan.
+const OUTFLOW_AUTO_INTERVAL_SEC = Number(process.env.OUTFLOW_INTERVAL_SEC ?? 10);
+
+// planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
 
 // Render port config (Render PORT env eken automatic set wenawa)
@@ -61,11 +67,17 @@ const PROJECT_TASK_SHEET_URL = () =>
 
 /*
 |--------------------------------------------------------------------------
-| HARDCODED BASIC AUTH
+| CREDENTIALS
+|--------------------------------------------------------------------------
+| Env variables set karala thiyenawanam ewa use wenawa, nathnam kalin
+| thibba default values. Render dashboard eke Environment walata danna:
+|   AUTH_USER, AUTH_PASS, GRAFANA_USER, GRAFANA_PASS
 |--------------------------------------------------------------------------
 */
-const AUTH_USER = "admin";
-const AUTH_PASS = "password123";
+const AUTH_USER = process.env.AUTH_USER || "admin";
+const AUTH_PASS = process.env.AUTH_PASS || "password123";
+const GRAFANA_USER = process.env.GRAFANA_USER || "gss.kurunegala@gssintl.biz";
+const GRAFANA_PASS = process.env.GRAFANA_PASS || "Gssk@2021";
 
 /*
 |--------------------------------------------------------------------------
@@ -103,10 +115,6 @@ function authenticate(req) {
 |--------------------------------------------------------------------------
 | DATE PARAM HELPERS
 |--------------------------------------------------------------------------
-| `date` query param eka `YYYY-MM-DD` format ekata match wenawada balala,
-| SQL injection wenna bæ widihata sanitize karala, valid nam ema string eka
-| return karanawa. Invalid/missing unoth `null` return karanawa (=> "today").
-|--------------------------------------------------------------------------
 */
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -114,8 +122,6 @@ function parseDateParam(query) {
   const raw = query && query.date ? String(query.date).trim() : "";
   if (!raw) return null;
   if (!DATE_RE.test(raw)) return null;
-  // Extra sanity check - make sure it's a real calendar date (e.g. rejects
-  // 2026-02-31), not just a string that matches the shape.
   const [y, m, d] = raw.split("-").map(Number);
   const check = new Date(Date.UTC(y, m - 1, d));
   if (check.getUTCFullYear() !== y || check.getUTCMonth() !== m - 1 || check.getUTCDate() !== d) {
@@ -124,11 +130,6 @@ function parseDateParam(query) {
   return raw;
 }
 
-// Builds the BigQuery WHERE-clause fragment for the requested day.
-//  - No date (or invalid date) => same "today, up to right now" window as
-//    the original queries always used.
-//  - A specific past/present date => the full 00:00:00–23:59:59.999999
-//    window for that calendar date.
 function buildDateRangeClause(dateStr) {
   if (dateStr) {
     return `event_timestamp BETWEEN TIMESTAMP('${dateStr} 00:00:00') AND TIMESTAMP('${dateStr} 23:59:59.999999')`;
@@ -147,13 +148,10 @@ let loginPromise = null;
 async function loginToGrafana() {
   console.log("🔐 Logging into Grafana to get fresh session...");
 
-  const username = "gss.kurunegala@gssintl.biz";
-  const password = "Gssk@2021";
-
   try {
     const response = await axios.post(
       "https://monitor-public.trax-cloud.com/login",
-      { user: username, password: password },
+      { user: GRAFANA_USER, password: GRAFANA_PASS },
       {
         headers: { "Content-Type": "application/json" },
         maxRedirects: 0,
@@ -241,13 +239,11 @@ async function getQueryResults(resultUrl) {
 
 /*
 |--------------------------------------------------------------------------
-| BUILD SQL — 3 variants (team leader / staff id / project+task)
-|--------------------------------------------------------------------------
-| Every builder now takes an optional `dateStr` (YYYY-MM-DD, already
-| validated by parseDateParam) and swaps in the matching date-range clause.
+| BUILD SQL — variants (team leader / staff id / project+task / outflow)
 |--------------------------------------------------------------------------
 */
 function buildQueryByTeamLeader(tlName, dateStr) {
+  const safeTl = String(tlName).replace(/'/g, "\\'");
   const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
@@ -269,7 +265,7 @@ function buildQueryByTeamLeader(tlName, dateStr) {
         ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND team_leader_staff_id = '${tlName}'
+        AND team_leader_staff_id = '${safeTl}'
       GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
@@ -335,13 +331,34 @@ function buildQueryByProjectTask(project, task, dateStr) {
   };
 }
 
+// MODE 5: Project outflow (kalin standalone script eke query eka).
+// Kalin "CONCAT(project_name,' | ',task_name,' | ',center)" karala pasuwa
+// split karanawa wenuwata, dan columns 3ma wenama select karanawa - e nisa
+// project name ekaka " | " thibunath data waradi wenne na.
+function buildQueryOutflow(dateStr) {
+  const dateClause = dateStr
+    ? `DATE(event_timestamp) = DATE('${dateStr}')`
+    : `DATE(event_timestamp) = CURRENT_DATE()`;
+  return {
+    query: `
+      #standardSQL
+      SELECT
+        project_name,
+        task_name,
+        center,
+        SUM(count) AS value
+      FROM \`trax-retail.backoffice.560_project_outflow\`
+      WHERE ${dateClause}
+      GROUP BY 1, 2, 3
+      ORDER BY value DESC
+    `,
+    useLegacySql: false,
+  };
+}
+
 /*
 |--------------------------------------------------------------------------
 | TEMPLATE NAME LOOKUP
-|--------------------------------------------------------------------------
-| Some tasks share the same underlying UI/template, so we tag them with a
-| common `template_name` value. Only the tasks listed below get a
-| template_name - everything else gets null (no template_name grouping).
 |--------------------------------------------------------------------------
 */
 const normKeySimple = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
@@ -384,15 +401,6 @@ function processResults(result) {
         staff_id: obj.staff_id || "",
         value: Number(obj.value || 0),
       };
-      // template_name eka row ekata attach karanne "voting/validation"
-      // vage TEMPLATE_NAME_TASKS walata witharak neme:
-      //  - PGES walatath (task eka monawa unath) - Repair Only vs
-      //    Repair & Attribute decide karanna
-      //  - UF_PRIORITY_PROJECTS walatath (task eka monawa unath) - Menu
-      //    vs offline_posm decide karanna
-      // Meka nathnam lookupDenominator ekata templateName ehema undefined
-      // widihata yanawa, e nisa "menu"/"posm" substring check eka never
-      // trigger wenne nathi.
       const isPges = normKeySimple(obj.project_name) === 'pges';
       const isUFPriority = UF_PRIORITY_PROJECTS.has(normKeySimple(obj.project_name));
       if ((isTemplateNameTask(obj.task_name) || isPges || isUFPriority) && obj.template_name) {
@@ -402,9 +410,25 @@ function processResults(result) {
     });
 }
 
+// MODE 5 rows: { project, task, center, value }  (kalin script eke output shape eka)
+function processOutflowResults(result) {
+  if (!result.rows) return [];
+  const fields = result.schema.fields.map(f => f.name);
+  return result.rows.map(row => {
+    const obj = {};
+    row.f.forEach((cell, i) => { obj[fields[i]] = cell.v; });
+    return {
+      project: obj.project_name || "N/A",
+      task: obj.task_name || "N/A",
+      center: obj.center || "N/A",
+      value: Number(obj.value || 0),
+    };
+  });
+}
+
 /*
 |--------------------------------------------------------------------------
-| FIREBASE SAVE / READ (path parameter eken kaka data save/read karanawada kiyala decide karanawa)
+| FIREBASE SAVE / READ
 |--------------------------------------------------------------------------
 */
 async function saveToFirebase(firebasePath, payload) {
@@ -422,6 +446,12 @@ async function getFromFirebase(firebasePath) {
   }
 }
 
+// MODE 5 - wenama Firebase database ekata (project-gap.json) save karanawa
+async function saveOutflowToFirebase(payload) {
+  await axios.put(FIREBASE_OUTFLOW_URL, payload, { timeout: 30000 });
+  console.log("  🔥 Outflow Firebase updated (project-gap.json)");
+}
+
 /*
 |--------------------------------------------------------------------------
 | DENOMINATOR LOOKUP (normalized keys - lowercase + trimmed)
@@ -432,18 +462,12 @@ async function getFromFirebase(firebasePath) {
 |   Table 1 "Denominator Sheet"  -> columns A:Y  (Project + task-name grid)
 |   Table 2 "UF Denominator"     -> columns AA:AD (Project, Task, Sub Task, Denominator)
 |
-| They are NOT row-aligned - row N of table 1 and row N of table 2 belong
-| to completely different projects, they just happen to sit on the same
-| CSV line. Row 1 of the CSV is a merged title row ("Denominator Sheet" /
-| "UF Denominator ") - the REAL column headers are on row 2, and data
-| starts on row 3.
+| They are NOT row-aligned. Row 1 of the CSV is a merged title row - the
+| REAL column headers are on row 2, and data starts on row 3.
 |--------------------------------------------------------------------------
 */
 const normKey = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
 
-// Projects that should primarily resolve their denominator from the UF
-// Denominator table's "Menu" rows before falling back to the main matrix /
-// hardcoded fallback.
 const UF_PRIORITY_PROJECTS = new Set([
   'batru',
   'diageopl', 'diageoes', 'diageopebac', 'diageoromania', 'aneuae',
@@ -453,9 +477,6 @@ const UF_PRIORITY_PROJECTS = new Set([
   'diageostr', 'diageogtr'
 ].map(normKey));
 
-// When matching against the UF Denominator table, voting/offline_voting are
-// treated as the same task, and validation/offline_validation are treated
-// as the same task.
 const TASK_EQUIV_GROUPS = {
   voting: ['voting', 'offline_voting'],
   offline_voting: ['voting', 'offline_voting'],
@@ -472,8 +493,6 @@ function ufKey(project, task, subtask) {
   return `${normKey(project)}||${normKey(task)}||${normKey(subtask)}`;
 }
 
-// Column headers that appear in the main "Denominator Sheet" table's header
-// row but are NOT task columns (they end the task-column range).
 const NON_TASK_HEADERS = new Set(['vlookup', 'region']);
 
 // Fixed column offsets of the UF Denominator table (columns AA:AD).
@@ -497,9 +516,6 @@ async function fetchDenominatorSheet() {
     });
 
     const lines = response.data.split(/\r?\n/).filter(l => l.trim().length > 0);
-    // Row 1 (index 0) is the merged title row ("Denominator Sheet" / "UF
-    // Denominator "), row 2 (index 1) has the real column headers, data
-    // starts at row 3 (index 2).
     if (lines.length < 3) return { byProjectTask: {}, byGID: {}, rows: [], uf: {}, ufRowsByProject: {} };
 
     const splitLine = (line) =>
@@ -507,8 +523,6 @@ async function fetchDenominatorSheet() {
 
     const headerCells = splitLine(lines[1]);
 
-    // Find where the main table's task columns end (first blank header,
-    // or a known non-task header like VLOOKUP/Region).
     let mainTableEnd = headerCells.length;
     for (let c = 1; c < headerCells.length; c++) {
       const h = normKey(headerCells[c]);
@@ -602,15 +616,10 @@ function taskFallback(normTask) {
   return 0;
 }
 
-// Finds the best UF Denominator table row for (project, task), where task
-// equivalence (voting<->offline_voting, validation<->offline_validation)
-// applies across the WHOLE UF table for that project - not just "Menu"
-// rows. An exact task match always wins over an equivalent-task match, and
-// a "Menu" subtask row always wins over any other subtask, so:
-//   1. exact task, subtask = Menu
-//   2. exact task, any other subtask   (e.g. offline_voting -> offline_voting)
-//   3. equivalent task, subtask = Menu
-//   4. equivalent task, any other subtask
+// 1. exact task, subtask = Menu
+// 2. exact task, any other subtask
+// 3. equivalent task, subtask = Menu
+// 4. equivalent task, any other subtask
 function findUFDenominator(project, task, ufRowsByProject) {
   const rows = ufRowsByProject[normKey(project)];
   if (!rows || !rows.length) return undefined;
@@ -635,9 +644,6 @@ function findUFDenominator(project, task, ufRowsByProject) {
   return undefined;
 }
 
-// Finds a UF Denominator table row for (project, task, subtask) - used for
-// PGES's "Repair Only" / "Repair & Attribute" rows - where task equivalence
-// still applies (exact task match preferred over an equivalent-task match).
 function findUFDenominatorBySubtask(project, task, subtask, ufRowsByProject) {
   const rows = ufRowsByProject[normKey(project)];
   if (!rows || !rows.length) return undefined;
@@ -655,12 +661,6 @@ function findUFDenominatorBySubtask(project, task, subtask, ufRowsByProject) {
   return exact !== undefined ? exact : equiv;
 }
 
-// Finds a UF Denominator table row whose Sub Task column is itself a
-// task-like value (e.g. "offline_voting", "voting", "validation",
-// "offline_validation") that matches the row's own task - used as the
-// no-"menu"-in-template_name fallback for UF_PRIORITY_PROJECTS. Task
-// equivalence still applies (exact match on Sub Task preferred over an
-// equivalent-task Sub Task match).
 function findUFDenominatorByTaskAsSubtask(project, task, ufRowsByProject) {
   const rows = ufRowsByProject[normKey(project)];
   if (!rows || !rows.length) return undefined;
@@ -681,20 +681,12 @@ function lookupDenominator(project, task, denominatorData, templateName) {
   const normTask    = normKey(task);
   const ufRowsByProject = denominatorData.ufRowsByProject || {};
 
-  // Special case: PGES resolves its denominator from the UF table using
-  // "Repair Only" when the row's own template_name is "display", and
-  // "Repair & Attribute" for every other template_name.
+  // PGES: "Repair Only" when template_name contains "display", else "Repair & Attribute".
   if (normProject === 'pges') {
-    // "Display" kiyana word eka template_name eke kohewath (exact match
-    // nathuwa, substring widihata) thiyenawa nam "Repair Only" - nathnam
-    // "Repair & Attribute".
     const subtask = normKey(templateName).includes('display') ? 'Repair Only' : 'Repair & Attribute';
     const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   } else if (UF_PRIORITY_PROJECTS.has(normProject)) {
-    // Priority projects: if template_name has "menu" or "posm" anywhere
-    // in it (substring, not exact match), pull the UF Denominator row for
-    // that specific Sub Task ("Menu" / "offline_posm") directly.
     const tName = normKey(templateName);
     let uiSubtask = null;
     if (tName.includes('menu')) uiSubtask = 'Menu';
@@ -704,18 +696,10 @@ function lookupDenominator(project, task, denominatorData, templateName) {
       const ufSubtaskValue = findUFDenominatorBySubtask(normProject, normTask, uiSubtask, ufRowsByProject);
       if (ufSubtaskValue !== undefined) return ufSubtaskValue;
     } else {
-      // No "menu"/"posm" in template_name: resolve the Sub Task by
-      // matching the task itself (e.g. Sub Task = "offline_voting",
-      // "voting", "validation", "offline_validation"), not by preferring
-      // a "Menu" row.
       const taskSubtaskValue = findUFDenominatorByTaskAsSubtask(normProject, normTask, ufRowsByProject);
       if (taskSubtaskValue !== undefined) return taskSubtaskValue;
     }
 
-    // Fallback (no menu/posm in template_name, or no matching UF row found):
-    // resolve from the UF Denominator table the original way, treating
-    // voting/offline_voting and validation/offline_validation as the same
-    // task when searching it.
     const ufValue = findUFDenominator(normProject, normTask, ufRowsByProject);
     if (ufValue !== undefined) return ufValue;
   }
@@ -809,8 +793,7 @@ async function fetchAllStaff(staffIds, dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 3: Project + Task filtered (no denominator enrichment,
-| matches original behaviour of the filtered-only server)
+| FETCH — MODE 3: Project + Task filtered
 |--------------------------------------------------------------------------
 */
 async function fetchFilteredByProjectTask(project, task, dateStr) {
@@ -830,16 +813,6 @@ async function fetchFilteredByProjectTask(project, task, dateStr) {
 |--------------------------------------------------------------------------
 | FETCH — MODE 4: Planning (multiple project+task+target combos)
 |--------------------------------------------------------------------------
-| Planning entries are stored in Firebase at /planning.json, keyed by an
-| auto-generated id:
-|   { [id]: { project_name, task_name, target, actual, percentage,
-|              staff_breakdown: [{staff_id, value}, ...], ... } }
-|
-| refreshAllPlanning() walks every entry, re-fetches "actual" (sum of
-| `value` for that project+task, reusing MODE 3's query/processing, no
-| denominator enrichment) plus a staff_id-wise breakdown of that same
-| total, and writes the whole map back to Firebase.
-|--------------------------------------------------------------------------
 */
 async function fetchPlanningActual(entry, dateStr) {
   const rows = await fetchFilteredByProjectTask(entry.project_name, entry.task_name, dateStr);
@@ -847,8 +820,6 @@ async function fetchPlanningActual(entry, dateStr) {
   const target = Number(entry.target) || 0;
   const percentage = target > 0 ? Math.round((actual / target) * 1000) / 10 : 0;
 
-  // Staff-id-wise breakdown: sum `value` per staff_id across all the hourly
-  // rows returned for this project+task, sorted highest contributor first.
   const staffMap = {};
   rows.forEach((r) => {
     const sid = r.staff_id || "unknown";
@@ -889,6 +860,93 @@ async function refreshAllPlanning(dateStr) {
 
   await saveToFirebase(FIREBASE_PATH_PLANNING, updated);
   return updated;
+}
+
+/*
+|--------------------------------------------------------------------------
+| FETCH — MODE 5: Project Outflow (project | task | center)
+|--------------------------------------------------------------------------
+| Kalin standalone script eke logic ekama: 560_project_outflow table eken
+| project/task/center wise SUM(count) aran, wenama Firebase database ekaka
+| /project-gap.json ekata PUT karanawa.
+|
+| Saved shape (kalin ekama):
+|   { lastUpdated, date, total_rows, data: [{ project, task, center, value }] }
+|
+| BigQuery result eka pages walata kadala enna puluwan, e nisa pageToken
+| thiyenakan ma ella pages ekathu karagannawa.
+|--------------------------------------------------------------------------
+*/
+async function fetchOutflow(dateStr) {
+  console.log(`\n>>> [OUTFLOW] Fetching project outflow... date="${dateStr || 'today'}"`);
+  const query = buildQueryOutflow(dateStr);
+  const response = await grafanaRequest('POST', QUERY_URL, query);
+  const jobId = response.data.jobReference.jobId;
+  const location = response.data.jobReference.location;
+  const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
+
+  let result = await getQueryResults(resultUrl);
+  let rows = processOutflowResults(result);
+
+  // Extra pages (large result sets)
+  let pageToken = result.pageToken;
+  let pages = 1;
+  while (pageToken && pages < 50) {
+    const pageRes = await grafanaRequest(
+      'GET',
+      `${resultUrl}&pageToken=${encodeURIComponent(pageToken)}`
+    );
+    result = pageRes.data;
+    rows = rows.concat(processOutflowResults(result));
+    pageToken = result.pageToken;
+    pages++;
+  }
+
+  console.log(`  Rows found: ${rows.length}`);
+  return rows;
+}
+
+// Overlap guard - aluth refresh ekak start wenna kalin kalin ekak iwara wela nathnam skip karanawa
+let outflowRunning = false;
+
+async function refreshOutflow(dateStr) {
+  const rows = await fetchOutflow(dateStr);
+  const payload = {
+    lastUpdated: new Date().toISOString(),
+    date: dateStr || "today",
+    total_rows: rows.length,
+    data: rows,
+  };
+  await saveOutflowToFirebase(payload);
+  return payload;
+}
+
+async function autoRefreshOutflowOnce() {
+  if (outflowRunning) {
+    console.log("  ⏭️ [OUTFLOW] Previous refresh still running, skipping this tick");
+    return;
+  }
+  outflowRunning = true;
+  try {
+    await refreshOutflow(null); // auto-refresh eka hemadama "today"
+    console.log("✅ [OUTFLOW] Updated:", new Date().toLocaleTimeString());
+  } catch (err) {
+    console.error("❌ [OUTFLOW] Auto refresh error:", err.message);
+  } finally {
+    outflowRunning = false;
+  }
+}
+
+function startOutflowAutoLoop() {
+  if (!OUTFLOW_AUTO_INTERVAL_SEC || OUTFLOW_AUTO_INTERVAL_SEC <= 0) {
+    console.log("  ⏸️ [OUTFLOW] Auto refresh disabled (OUTFLOW_INTERVAL_SEC=0)");
+    return;
+  }
+  const loop = async () => {
+    await autoRefreshOutflowOnce();
+    setTimeout(loop, OUTFLOW_AUTO_INTERVAL_SEC * 1000);
+  };
+  loop();
 }
 
 /*
@@ -951,14 +1009,12 @@ async function fetchProjectTaskLookup() {
 |--------------------------------------------------------------------------
 */
 function parseIdsParam(query) {
-  // `ids=A,B,C` or single `id=A` style params (used for staff_ids/tl_names)
   const raw = query.staff_ids || query.staff_id || query.tl_names || query.tl_name;
   if (!raw) return [];
   if (Array.isArray(raw)) return raw.map(s => String(s).trim()).filter(Boolean);
   return String(raw).split(',').map(s => s.trim()).filter(Boolean);
 }
 
-// Reads and JSON-parses a request body (used by POST /planning).
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -1001,10 +1057,8 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
   const query = parsed.query;
 
-  // NOTE: The original "Project+Task filtered" frontend never sent Basic
-  // Auth credentials (its source server had no auth check at all), so we
-  // exempt /fetch-filtered here to match that frontend's existing behaviour.
-  // Every other endpoint keeps requiring Basic Auth like before.
+  // /fetch-filtered saha /planning-ui walata Basic Auth oni na (kalin widihatama).
+  // Anith okkoma endpoints (/fetch-outflow ekath ekka) Basic Auth oni.
   const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
@@ -1022,9 +1076,10 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow)",
         time: new Date().toISOString(),
-        cors: "enabled"
+        cors: "enabled",
+        outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC
       }));
       return;
     }
@@ -1082,12 +1137,10 @@ const server = http.createServer(async (req, res) => {
 
     // -------------------------------------------------------------
     // Single fetch — /fetch?tl_name=...  OR  /fetch?staff_id=...
-    // Both accept an optional &date=YYYY-MM-DD
     // -------------------------------------------------------------
     if (pathname === "/fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
 
-      // staff_id takes priority if both are supplied
       if (query.staff_id) {
         const staffId = String(query.staff_id).trim();
         const data = await fetchSingleStaff(staffId, dateStr);
@@ -1169,8 +1222,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Planning UI — serves the bundled planning.html tool itself (same
-    // origin as the API, so it needs no manual server URL/credentials).
+    // -------------------------------------------------------------
+    // MODE 5: PROJECT OUTFLOW — /fetch-outflow?date=YYYY-MM-DD
+    // Data eka projectgap Firebase eke /project-gap.json ekata yanawa.
+    // (Auto-refresh loop eka nisa manual call karanna oni na - oni nam kalata
+    //  kalata / past date ekak ganna meka use karanna puluwan.)
+    // -------------------------------------------------------------
+    if (pathname === "/fetch-outflow" && req.method === "GET") {
+      const dateStr = parseDateParam(query);
+      const payload = await refreshOutflow(dateStr);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        mode: "outflow",
+        date: payload.date,
+        rows: payload.data,
+        total: payload.total_rows,
+        updated_at: payload.lastUpdated,
+      }));
+      return;
+    }
+
+    // Planning UI
     if (pathname === "/planning-ui" && req.method === "GET") {
       fs.readFile(PLANNING_HTML_PATH, "utf8", (err, html) => {
         if (err) {
@@ -1185,9 +1258,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 4: PLANNING — pick several project+task combos, give each a
-    // target, and track actual-vs-target. All entries live under Firebase
-    // /planning.json.
+    // MODE 4: PLANNING
     // -------------------------------------------------------------
 
     // GET /planning  -> list every planning entry
@@ -1249,9 +1320,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // GET /planning-fetch?date=YYYY-MM-DD  -> refresh "actual" for every
-    // planning entry (queries BigQuery per project+task) and saves back to
-    // Firebase /planning.json
+    // GET /planning-fetch?date=YYYY-MM-DD
     if (pathname === "/planning-fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
       const updated = await refreshAllPlanning(dateStr);
@@ -1338,13 +1407,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log("================================");
   console.log(`  🚀 QAT Server (Unified) running on http://${HOST}:${PORT}`);
-  console.log(`  🔐 Basic Auth: ${AUTH_USER} / ${AUTH_PASS}`);
+  console.log(`  🔐 Basic Auth user: ${AUTH_USER}`);
   console.log(`  🌐 CORS: Enabled for all origins`);
   console.log(`  🔥 Firebase paths:`);
   console.log(`     TL mode      -> ${FIREBASE_PATH_TL}`);
   console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
   console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
   console.log(`     Planning     -> ${FIREBASE_PATH_PLANNING}`);
+  console.log(`     Outflow      -> ${FIREBASE_OUTFLOW_URL}`);
   console.log(`  📊 Endpoints (all accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
   console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
@@ -1352,14 +1422,18 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
+  console.log(`    GET  /fetch-outflow                     - Project outflow -> project-gap.json`);
   console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
   console.log(`    GET  /planning                          - List planning entries`);
   console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
   console.log(`    DEL  /planning?id=                      - Remove a planning entry`);
   console.log(`    GET  /planning-fetch                    - Refresh actual/% for all -> ${FIREBASE_PATH_PLANNING}`);
   console.log(`    GET  /staff-lookup                      - Staff name lookup`);
-  console.log(`    GET  /project-task-lookup                - Project/Task lookup`);
-  console.log(`    GET  /denominator-lookup                 - Denominator lookup`);
-  console.log(`    GET  /team-leaders | /staff-ids          - Default ID list`);
+  console.log(`    GET  /project-task-lookup               - Project/Task lookup`);
+  console.log(`    GET  /denominator-lookup                - Denominator lookup`);
+  console.log(`    GET  /team-leaders | /staff-ids         - Default ID list`);
   console.log("================================");
+
+  // MODE 5 background auto-refresh (kalin standalone script eke loop eka wage)
+  startOutflowAutoLoop();
 });
