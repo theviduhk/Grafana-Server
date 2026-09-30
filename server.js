@@ -16,9 +16,17 @@ const path = require("path");
 |   5. Project Outflow (project | task | center) -> projectgap Firebase
 |                                                   Firebase /project-gap.json
 |
-| Sema fetch mode 3ma dæn OPTIONAL `date=YYYY-MM-DD` query param eka
-| support karanawa. Date eka denne nathnam (allathwa waradi format eka
-| dunnoth) default eka widihata "today" query eka run wenawa.
+| Modes 1-4 support optional `date=YYYY-MM-DD`. Date eka denne nathnam
+| (allathwa waradi format eka dunnoth) default eka widihata "today" query
+| eka run wenawa.
+|
+| MODE 5 (/fetch-outflow) supports more:
+|   (none)                                   -> today   (also saved to Firebase)
+|   ?date=YYYY-MM-DD                         -> that single day
+|   ?range=today|yesterday|day_before|last_week
+|   ?from=YYYY-MM-DD&to=YYYY-MM-DD           -> custom range (max 92 days)
+| Only "today" is written to Firebase (project-gap.json). Past dates / ranges
+| are returned to the caller only, so they can never overwrite today's data.
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -41,6 +49,14 @@ const FIREBASE_OUTFLOW_URL =
 // /fetch-outflow call witharak). Render env eken OUTFLOW_INTERVAL_SEC
 // widihata change karanna puluwan.
 const OUTFLOW_AUTO_INTERVAL_SEC = Number(process.env.OUTFLOW_INTERVAL_SEC ?? 10);
+
+// Longest custom range /fetch-outflow will accept (days, inclusive).
+const OUTFLOW_MAX_RANGE_DAYS = Number(process.env.OUTFLOW_MAX_RANGE_DAYS ?? 92);
+
+// What "Previous Week" (range=last_week) means:
+//   "calendar" -> the last full Monday-Sunday week (default)
+//   "rolling"  -> the 7 days ending yesterday
+const PREVIOUS_WEEK_MODE = (process.env.PREVIOUS_WEEK_MODE || "calendar").toLowerCase();
 
 // planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
@@ -118,16 +134,20 @@ function authenticate(req) {
 */
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function parseDateParam(query) {
-  const raw = query && query.date ? String(query.date).trim() : "";
-  if (!raw) return null;
-  if (!DATE_RE.test(raw)) return null;
-  const [y, m, d] = raw.split("-").map(Number);
+// Returns the same string if it is a real calendar date in YYYY-MM-DD form, else null.
+function parseYMD(raw) {
+  const s = raw ? String(raw).trim() : "";
+  if (!s || !DATE_RE.test(s)) return null;
+  const [y, m, d] = s.split("-").map(Number);
   const check = new Date(Date.UTC(y, m - 1, d));
   if (check.getUTCFullYear() !== y || check.getUTCMonth() !== m - 1 || check.getUTCDate() !== d) {
     return null;
   }
-  return raw;
+  return s;
+}
+
+function parseDateParam(query) {
+  return parseYMD(query && query.date);
 }
 
 function buildDateRangeClause(dateStr) {
@@ -135,6 +155,96 @@ function buildDateRangeClause(dateStr) {
     return `event_timestamp BETWEEN TIMESTAMP('${dateStr} 00:00:00') AND TIMESTAMP('${dateStr} 23:59:59.999999')`;
   }
   return `event_timestamp BETWEEN TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY) AND CURRENT_TIMESTAMP()`;
+}
+
+/*
+|--------------------------------------------------------------------------
+| OUTFLOW DATE RANGE RESOLVER
+|--------------------------------------------------------------------------
+| All calendar maths is done in UTC, the same day boundary BigQuery's
+| CURRENT_DATE() uses for "today", so presets and today stay consistent.
+|--------------------------------------------------------------------------
+*/
+function todayUTC() {
+  const n = new Date();
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate()));
+}
+
+function addDaysUTC(d, n) {
+  const x = new Date(d.getTime());
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+}
+
+function ymdUTC(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+function daysBetweenInclusive(fromStr, toStr) {
+  const a = Date.parse(`${fromStr}T00:00:00Z`);
+  const b = Date.parse(`${toStr}T00:00:00Z`);
+  return Math.round((b - a) / 86400000) + 1;
+}
+
+// -> { key, from, to, isToday }  or  { error }
+function resolveOutflowRange(query) {
+  const today = todayUTC();
+  const todayStr = ymdUTC(today);
+  const range = query.range ? String(query.range).trim().toLowerCase() : "";
+  const fromRaw = query.from ? String(query.from).trim() : "";
+  const toRaw = query.to ? String(query.to).trim() : "";
+
+  let key, from, to;
+
+  if (fromRaw || toRaw) {
+    // Custom range: both ends required and valid
+    const f = parseYMD(fromRaw);
+    const t = parseYMD(toRaw);
+    if (!f || !t) return { error: "from and to must both be valid YYYY-MM-DD dates" };
+    key = "custom";
+    from = f <= t ? f : t;
+    to = f <= t ? t : f;
+  } else if (range && range !== "today") {
+    if (range === "yesterday") {
+      key = "yesterday";
+      from = to = ymdUTC(addDaysUTC(today, -1));
+    } else if (range === "day_before") {
+      key = "day_before";
+      from = to = ymdUTC(addDaysUTC(today, -2));
+    } else if (range === "last_week") {
+      key = "last_week";
+      if (PREVIOUS_WEEK_MODE === "rolling") {
+        from = ymdUTC(addDaysUTC(today, -7));
+        to = ymdUTC(addDaysUTC(today, -1));
+      } else {
+        const sinceMonday = (today.getUTCDay() + 6) % 7; // Mon=0 ... Sun=6
+        const thisMonday = addDaysUTC(today, -sinceMonday);
+        from = ymdUTC(addDaysUTC(thisMonday, -7));
+        to = ymdUTC(addDaysUTC(thisMonday, -1));
+      }
+    } else {
+      return { error: "range must be one of: today, yesterday, day_before, last_week" };
+    }
+  } else if (query.date) {
+    // Backwards compatible single-day param
+    const d = parseDateParam(query);
+    if (!d) return { error: "date must be a valid YYYY-MM-DD date" };
+    key = "date";
+    from = to = d;
+  } else {
+    key = "today";
+    from = to = todayStr;
+  }
+
+  if (from > todayStr) return { error: "The selected dates are in the future" };
+  if (to > todayStr) to = todayStr; // ranges can't run past today
+
+  const span = daysBetweenInclusive(from, to);
+  if (span > OUTFLOW_MAX_RANGE_DAYS) {
+    return { error: `Range too large (${span} days). Maximum is ${OUTFLOW_MAX_RANGE_DAYS} days` };
+  }
+
+  return { key, from, to, isToday: from === todayStr && to === todayStr };
 }
 
 /*
@@ -227,9 +337,11 @@ async function grafanaRequest(method, reqUrl, data = null, retryCount = 0) {
 |--------------------------------------------------------------------------
 | BIGQUERY — poll until job complete
 |--------------------------------------------------------------------------
+| maxTries * 2s = max wait. Default 10 (20s). Range queries pass a bigger number.
+|--------------------------------------------------------------------------
 */
-async function getQueryResults(resultUrl) {
-  for (let i = 0; i < 10; i++) {
+async function getQueryResults(resultUrl, maxTries = 10) {
+  for (let i = 0; i < maxTries; i++) {
     const res = await grafanaRequest('GET', resultUrl);
     if (res.data.jobComplete) return res.data;
     await new Promise(r => setTimeout(r, 2000));
@@ -335,10 +447,19 @@ function buildQueryByProjectTask(project, task, dateStr) {
 // Kalin "CONCAT(project_name,' | ',task_name,' | ',center)" karala pasuwa
 // split karanawa wenuwata, dan columns 3ma wenama select karanawa - e nisa
 // project name ekaka " | " thibunath data waradi wenne na.
-function buildQueryOutflow(dateStr) {
-  const dateClause = dateStr
-    ? `DATE(event_timestamp) = DATE('${dateStr}')`
-    : `DATE(event_timestamp) = CURRENT_DATE()`;
+//
+// fromStr / toStr = 'YYYY-MM-DD' (already validated by resolveOutflowRange, so safe to inline).
+// Both null -> today via CURRENT_DATE(). Output shape is identical for a day or a range:
+// values are summed per project / task / center over the whole range.
+function buildQueryOutflow(fromStr, toStr) {
+  let dateClause;
+  if (fromStr && toStr) {
+    dateClause = fromStr === toStr
+      ? `DATE(event_timestamp) = DATE('${fromStr}')`
+      : `DATE(event_timestamp) BETWEEN DATE('${fromStr}') AND DATE('${toStr}')`;
+  } else {
+    dateClause = `DATE(event_timestamp) = CURRENT_DATE()`;
+  }
   return {
     query: `
       #standardSQL
@@ -866,10 +987,11 @@ async function refreshAllPlanning(dateStr) {
 |--------------------------------------------------------------------------
 | FETCH — MODE 5: Project Outflow (project | task | center)
 |--------------------------------------------------------------------------
-| Kalin standalone script eke logic ekama: 560_project_outflow table eken
-| project/task/center wise SUM(count) aran, wenama Firebase database ekaka
-| /project-gap.json ekata PUT karanawa.
+| 560_project_outflow table eken project/task/center wise SUM(count) aran
+| denawa. fromStr/toStr null nam "today" (CURRENT_DATE()); nathnam e day
+| eka / range eka.
 |
+| Saved to Firebase (/project-gap.json) ONLY for today - see refreshOutflow().
 | Saved shape (kalin ekama):
 |   { lastUpdated, date, total_rows, data: [{ project, task, center, value }] }
 |
@@ -877,15 +999,18 @@ async function refreshAllPlanning(dateStr) {
 | thiyenakan ma ella pages ekathu karagannawa.
 |--------------------------------------------------------------------------
 */
-async function fetchOutflow(dateStr) {
-  console.log(`\n>>> [OUTFLOW] Fetching project outflow... date="${dateStr || 'today'}"`);
-  const query = buildQueryOutflow(dateStr);
+async function fetchOutflow(fromStr, toStr) {
+  const label = fromStr && toStr ? (fromStr === toStr ? fromStr : `${fromStr}..${toStr}`) : "today";
+  console.log(`\n>>> [OUTFLOW] Fetching project outflow... date="${label}"`);
+  const query = buildQueryOutflow(fromStr, toStr);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
   const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
 
-  let result = await getQueryResults(resultUrl);
+  // Multi-day ranges scan more data, so allow the job longer to finish (30 x 2s = 60s)
+  const isMultiDay = !!(fromStr && toStr && fromStr !== toStr);
+  let result = await getQueryResults(resultUrl, isMultiDay ? 30 : 10);
   let rows = processOutflowResults(result);
 
   // Extra pages (large result sets)
@@ -909,11 +1034,13 @@ async function fetchOutflow(dateStr) {
 // Overlap guard - aluth refresh ekak start wenna kalin kalin ekak iwara wela nathnam skip karanawa
 let outflowRunning = false;
 
-async function refreshOutflow(dateStr) {
-  const rows = await fetchOutflow(dateStr);
+// TODAY only: fetch + write to Firebase (project-gap.json). Used by the auto loop and by
+// /fetch-outflow when the resolved range is today.
+async function refreshOutflow() {
+  const rows = await fetchOutflow(null, null);
   const payload = {
     lastUpdated: new Date().toISOString(),
-    date: dateStr || "today",
+    date: "today",
     total_rows: rows.length,
     data: rows,
   };
@@ -928,7 +1055,7 @@ async function autoRefreshOutflowOnce() {
   }
   outflowRunning = true;
   try {
-    await refreshOutflow(null); // auto-refresh eka hemadama "today"
+    await refreshOutflow(); // auto-refresh eka hemadama "today"
     console.log("✅ [OUTFLOW] Updated:", new Date().toLocaleTimeString());
   } catch (err) {
     console.error("❌ [OUTFLOW] Auto refresh error:", err.message);
@@ -1223,22 +1350,47 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 5: PROJECT OUTFLOW — /fetch-outflow?date=YYYY-MM-DD
-    // Data eka projectgap Firebase eke /project-gap.json ekata yanawa.
-    // (Auto-refresh loop eka nisa manual call karanna oni na - oni nam kalata
-    //  kalata / past date ekak ganna meka use karanna puluwan.)
+    // MODE 5: PROJECT OUTFLOW
+    //   /fetch-outflow                                 -> today  (saved to Firebase)
+    //   /fetch-outflow?range=yesterday|day_before|last_week|today
+    //   /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD   -> custom range
+    //   /fetch-outflow?date=YYYY-MM-DD                 -> single day (legacy)
+    // Only "today" is written to Firebase (project-gap.json). Past dates / ranges
+    // are returned in the response only, so they never overwrite today's data.
+    // Response: { success, mode, range, date, from, to, rows, total, updated_at, saved_to_firebase }
     // -------------------------------------------------------------
     if (pathname === "/fetch-outflow" && req.method === "GET") {
-      const dateStr = parseDateParam(query);
-      const payload = await refreshOutflow(dateStr);
+      const resolved = resolveOutflowRange(query);
+      if (resolved.error) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: resolved.error }));
+        return;
+      }
+
+      const { key, from, to, isToday } = resolved;
+      let rows, updatedAt;
+
+      if (isToday) {
+        const payload = await refreshOutflow(); // fetch + save to Firebase
+        rows = payload.data;
+        updatedAt = payload.lastUpdated;
+      } else {
+        rows = await fetchOutflow(from, to); // fetch only, no Firebase write
+        updatedAt = new Date().toISOString();
+      }
+
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         mode: "outflow",
-        date: payload.date,
-        rows: payload.data,
-        total: payload.total_rows,
-        updated_at: payload.lastUpdated,
+        range: key,
+        date: isToday ? "today" : (from === to ? from : `${from}..${to}`),
+        from,
+        to,
+        rows,
+        total: rows.length,
+        updated_at: updatedAt,
+        saved_to_firebase: isToday,
       }));
       return;
     }
@@ -1414,15 +1566,17 @@ server.listen(PORT, HOST, () => {
   console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
   console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
   console.log(`     Planning     -> ${FIREBASE_PATH_PLANNING}`);
-  console.log(`     Outflow      -> ${FIREBASE_OUTFLOW_URL}`);
-  console.log(`  📊 Endpoints (all accept optional &date=YYYY-MM-DD):`);
+  console.log(`     Outflow      -> ${FIREBASE_OUTFLOW_URL} (today only)`);
+  console.log(`  📊 Endpoints (most accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
   console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
-  console.log(`    GET  /fetch-outflow                     - Project outflow -> project-gap.json`);
+  console.log(`    GET  /fetch-outflow                     - Project outflow (today) -> project-gap.json`);
+  console.log(`    GET  /fetch-outflow?range=yesterday|day_before|last_week   - past preset (not saved)`);
+  console.log(`    GET  /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD          - custom range (not saved)`);
   console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
   console.log(`    GET  /planning                          - List planning entries`);
   console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
