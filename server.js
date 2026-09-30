@@ -42,7 +42,7 @@ const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning mode
 
 // MODE 5 (Outflow) - wenama Firebase database ekak, e nisa full URL eka.
 const FIREBASE_OUTFLOW_URL =
-  "https://projectgap-4b7d9-default-rtdb.firebaseio.com/project-gap.json";
+  "https://projectgap-4b7d9-default-rtdb.firebaseio.com/project-gaps.json";
 
 // Outflow data eka background eken auto-refresh wena gaman (seconds).
 // Kalin script eke wage 10s. 0 dunnoth auto-refresh nawathinawa (manual
