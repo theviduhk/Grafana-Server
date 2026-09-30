@@ -8,13 +8,18 @@ const path = require("path");
 |--------------------------------------------------------------------------
 | CONFIG
 |--------------------------------------------------------------------------
-| Meka thani server ekakin thanku data 5ma type eka handle karanawa:
+| Meka thani server ekakin thanku data 6ma type eka handle karanawa:
 |   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
 |   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
 |   3. Project + Task filtered fetch             -> /qat_filtered.json
 |   4. Planning (project + task + target, multi) -> /planning.json
 |   5. Project Outflow (project | task | center) -> projectgap Firebase
 |                                                   Firebase /project-gap.json
+|   6. QUEUE MONITOR (Grafana queue total + oldest task, per project)
+|        -> https://thevindu-8fe8b-default-rtdb.firebaseio.com/queue_monitor
+|        Project list eka hardcode na. Firebase "Server Projects" node eken
+|        (qat-output DB) load wenawa, e nisa dashboard eken project add/remove
+|        kalama queue monitor ekatath auto apply wenawa.
 |
 | Modes 1-4 support optional `date=YYYY-MM-DD`. Date eka denne nathnam
 | (allathwa waradi format eka dunnoth) default eka widihata "today" query
@@ -27,6 +32,10 @@ const path = require("path");
 |   ?from=YYYY-MM-DD&to=YYYY-MM-DD           -> custom range (max 92 days)
 | Only "today" is written to Firebase (project-gap.json). Past dates / ranges
 | are returned to the caller only, so they can never overwrite today's data.
+|
+| MODE 6 (queue monitor) background loop eken auto run wenawa. Manual:
+|   GET /queue-monitor/status    -> last run info
+|   GET /queue-monitor/refresh   -> ekhama cycle ekak run karanawa
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -57,6 +66,39 @@ const OUTFLOW_MAX_RANGE_DAYS = Number(process.env.OUTFLOW_MAX_RANGE_DAYS ?? 92);
 //   "calendar" -> the last full Monday-Sunday week (default)
 //   "rolling"  -> the 7 days ending yesterday
 const PREVIOUS_WEEK_MODE = (process.env.PREVIOUS_WEEK_MODE || "calendar").toLowerCase();
+
+/*
+|--------------------------------------------------------------------------
+| MODE 6 CONFIG - QUEUE MONITOR
+|--------------------------------------------------------------------------
+| QUEUE_FIREBASE_URL        data push wenna thena (thevindu DB -> queue_monitor)
+| SERVER_PROJECTS_URL       project list eka ganna thena (qat-output DB ->
+|                           "Server Projects" node). Node eke nama wenas nam
+|                           SERVER_PROJECTS_PATH eka change karanna.
+| QUEUE_INTERVAL_SEC        cycle ekak iwara wela kiyada pasu next eka (0 = off)
+| QUEUE_CONCURRENCY         ekama welawata Grafana ekata yana request gana
+| QUEUE_HEARTBEAT_SEC       queue count wenas nowunath, duration (oldest task)
+|                           stale nowenna mekata parak project eka push karanawa
+|                           (0 = off)
+| QUEUE_PROJECTS_CACHE_SEC  Server Projects list eka cache karana kalaya
+|--------------------------------------------------------------------------
+*/
+const QUEUE_FIREBASE_URL =
+  process.env.QUEUE_FIREBASE_URL ||
+  "https://thevindu-8fe8b-default-rtdb.firebaseio.com/queue_monitor.json";
+
+const SERVER_PROJECTS_PATH = "Server Projects";
+const SERVER_PROJECTS_URL =
+  process.env.SERVER_PROJECTS_URL ||
+  `${FIREBASE_URL}/${encodeURIComponent(SERVER_PROJECTS_PATH)}.json`;
+
+const QUEUE_GRAFANA_URL =
+  "https://monitor-public.trax-cloud.com/api/datasources/proxy/29/render";
+
+const QUEUE_INTERVAL_SEC = Number(process.env.QUEUE_INTERVAL_SEC ?? 3);
+const QUEUE_CONCURRENCY = Math.max(1, Number(process.env.QUEUE_CONCURRENCY ?? 5) || 5);
+const QUEUE_HEARTBEAT_SEC = Number(process.env.QUEUE_HEARTBEAT_SEC ?? 60);
+const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 30);
 
 // planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
@@ -1078,6 +1120,378 @@ function startOutflowAutoLoop() {
 
 /*
 |--------------------------------------------------------------------------
+| MODE 6: QUEUE MONITOR
+|--------------------------------------------------------------------------
+| Flow:
+|   1. "Server Projects" (qat-output Firebase) eken project list eka load
+|      karanawa  -> hardcode list eka nemei.
+|   2. Project hamadamata Grafana (datasource 29 /render) eken queue total +
+|      oldest task aran, metric 13 ekatama.
+|   3. Firebase eke thiyena eka samaga compare karala, wenas wela thiyena
+|      project witharak queue_monitor ekata PATCH karanawa. Count eka
+|      wenas wunama kalin value eka `previous` widihata save wenawa.
+|   4. Server Projects eken ain karapu project queue_monitor eken auto ain
+|      wenawa.
+|
+| Saved shape (project ekakata):
+|   queue_monitor/<project>/<metric name> = {
+|     current, duration, durationRaw, previous, lastUpdated
+|   }
+|--------------------------------------------------------------------------
+*/
+const QUEUE_METRICS = [
+  { path: "validation", name: "validation" },
+  { path: "offline_posm", name: "offline posm" },
+  { path: "voting", name: "voting" },
+  { path: "stitching", name: "stitching" },
+  { path: "Pricing_voting", name: "Pricing voting" },
+  { path: "offline_pricing", name: "offline pricing" },
+  { path: "Offline_Pricing_Voting", name: "Pricing voting" },
+  { path: "scene_recognition", name: "scene recognition" },
+  { path: "category_expert", name: "category expert" },
+  { path: "offline_validation", name: "offline validation" },
+  { path: "pricing_voting", name: "Pricing voting" },
+  { path: "voting_engine", name: "Engine Voting" },
+  { path: "offline_voting", name: "offline voting" }
+];
+
+// Graphite path ekata dana nisa project name eka safe wenna oni
+// (dot eka path separator, quote eka alias eka kadanawa).
+const QUEUE_PROJECT_NAME_RE = /^[a-z0-9_-]+$/;
+
+// seconds -> human readable
+function formatDuration(seconds) {
+  seconds = Math.floor(Number(seconds));
+  if (isNaN(seconds)) return null;
+
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${secs}s`;
+
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hours < 24) return `${hours}h ${mins}m`;
+
+  const days = Math.floor(hours / 24);
+  const hrs = hours % 24;
+  if (days < 7) return `${days}d ${hrs}h`;
+
+  const weeks = Math.floor(days / 7);
+  const remainingDays = days % 7;
+  return `${weeks}w ${remainingDays}d`;
+}
+
+// Grafana /render call (form-urlencoded). Shared session manager eka use karanawa.
+// Session expire unoth (401/403 ho JSON nemei response ekak) re-login karala retry.
+async function grafanaRender(body, retryCount = 0) {
+  let usedSession = null;
+  try {
+    const headers = await getGrafanaHeaders();
+    usedSession = grafanaSession;
+    const res = await axios.post(QUEUE_GRAFANA_URL, body, {
+      headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 30000
+    });
+    if (!Array.isArray(res.data)) {
+      const e = new Error("Unexpected Grafana render response (session expired?)");
+      e.badSession = true;
+      throw e;
+    }
+    return res.data;
+  } catch (error) {
+    const status = error.response && error.response.status;
+    const expired = status === 401 || status === 403 || error.badSession;
+    if (expired && retryCount < 2) {
+      console.warn("⚠️ [QUEUE] Session expired or invalid. Refreshing Grafana session...");
+      // Wena request ekak kalinma session eka refresh karala nam eka aye reset nokarana
+      if (grafanaSession === usedSession) grafanaSession = null;
+      return grafanaRender(body, retryCount + 1);
+    }
+    throw error;
+  }
+}
+
+// ---- Project list (Firebase "Server Projects") ----
+let queueProjectsCache = { list: [], ts: 0 };
+const queueWarnedNames = new Set();
+
+async function getQueueProjects(force = false) {
+  const now = Date.now();
+  if (
+    !force &&
+    queueProjectsCache.ts &&
+    now - queueProjectsCache.ts < QUEUE_PROJECTS_CACHE_SEC * 1000
+  ) {
+    return queueProjectsCache.list;
+  }
+
+  const res = await axios.get(SERVER_PROJECTS_URL, { timeout: 30000 });
+  const data = res.data;
+  const names = new Set();
+
+  if (data && typeof data === "object") {
+    for (const [key, val] of Object.entries(data)) {
+      if (val === null || val === undefined) continue;
+
+      let raw;
+      if (typeof val === "string") raw = val;
+      else if (typeof val === "object" && val.name) raw = String(val.name);
+      else raw = key;
+
+      const name = raw.trim().toLowerCase();
+      if (!name) continue;
+
+      if (!QUEUE_PROJECT_NAME_RE.test(name)) {
+        if (!queueWarnedNames.has(name)) {
+          queueWarnedNames.add(name);
+          console.warn(`  ⚠️ [QUEUE] Skipping invalid project name in Server Projects: "${raw}"`);
+        }
+        continue;
+      }
+      names.add(name);
+    }
+  }
+
+  const list = Array.from(names).sort();
+  queueProjectsCache = { list, ts: now };
+  return list;
+}
+
+// ---- Firebase mirror (queue_monitor node eke current state eka) ----
+let queueMirror = null;          // null = aye load karanna oni
+const queueLastPush = {};        // project -> last push time (ms)
+
+async function loadQueueMirror() {
+  const res = await axios.get(QUEUE_FIREBASE_URL, { timeout: 30000 });
+  queueMirror = (res.data && typeof res.data === "object") ? res.data : {};
+  console.log(`  📥 [QUEUE] Loaded ${Object.keys(queueMirror).length} existing project(s) from Firebase`);
+}
+
+// ---- Fetch one project's queue numbers from Grafana ----
+async function fetchQueueProject(project) {
+  const params = new URLSearchParams();
+  for (const m of QUEUE_METRICS) {
+    params.append("target", `alias(prod.gauges.selector.queue.${m.path}.${project}.total,'${m.name} - Total')`);
+    params.append("target", `alias(aliasByNode(prod.gauges.selector.queue.${m.path}.${project}.oldestTask,4),'${m.name} - Oldest Task')`);
+  }
+  params.append("from", "-1h");
+  params.append("until", "now");
+  params.append("format", "json");
+
+  const json = await grafanaRender(params.toString());
+  const projectData = {};
+
+  for (const series of json) {
+    if (!series || !Array.isArray(series.datapoints)) continue;
+
+    const validPoints = series.datapoints.filter(dp => dp[0] !== null);
+    const last = validPoints.pop();
+    if (!last) continue;
+
+    const value = String(last[0]);
+    const timestamp = new Date(last[1] * 1000).toISOString();
+
+    const isOldest = series.target.includes("Oldest Task");
+    const metricName = series.target
+      .replace(" - Total", "")
+      .replace(" - Oldest Task", "");
+
+    if (!projectData[metricName]) {
+      projectData[metricName] = {
+        current: null,
+        duration: null,
+        durationRaw: null,
+        lastUpdated: timestamp
+      };
+    }
+
+    if (isOldest) {
+      projectData[metricName].duration = formatDuration(value);
+      projectData[metricName].durationRaw = value;
+    } else {
+      projectData[metricName].current = value;
+    }
+  }
+
+  return projectData;
+}
+
+// Old + new data merge karala, wenas wela thiyenawada kiyala balanawa.
+// "changed" = metric aluth / ain una / queue count eka wenas una.
+function mergeQueueProject(oldProject, newData) {
+  const old = oldProject || {};
+  const merged = {};
+  let changed = false;
+
+  for (const [metric, nm] of Object.entries(newData)) {
+    const om = old[metric];
+    let previous = om ? (om.previous ?? null) : null;
+    const oldCur = om ? (om.current ?? null) : null;
+    const newCur = nm.current ?? null;
+
+    if (!om) {
+      changed = true;
+    } else if (oldCur !== newCur) {
+      if (oldCur !== null) previous = oldCur;
+      changed = true;
+    }
+
+    merged[metric] = {
+      current: newCur,
+      duration: nm.duration,
+      durationRaw: nm.durationRaw,
+      previous,
+      lastUpdated: nm.lastUpdated
+    };
+  }
+
+  if (Object.keys(old).some(k => !(k in newData))) changed = true;
+
+  return { merged, changed };
+}
+
+// Simple concurrency pool
+async function runPool(items, limit, worker) {
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const idx = next++;
+      if (idx >= items.length) return;
+      await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+}
+
+const queueState = {
+  running: false,
+  lastRunAt: null,
+  lastDurationMs: null,
+  lastProjectCount: 0,
+  lastPushedCount: 0,
+  lastErrorCount: 0,
+  lastError: null
+};
+
+// Cycle ekak: projects load -> Grafana fetch -> diff -> Firebase PATCH
+async function runQueueCycle() {
+  if (queueState.running) return { skipped: true, reason: "previous cycle still running" };
+
+  queueState.running = true;
+  const started = Date.now();
+
+  try {
+    const projects = await getQueueProjects();
+    if (!projects.length) {
+      console.log("  ⚠️ [QUEUE] No projects found in Server Projects - nothing to monitor");
+      queueState.lastProjectCount = 0;
+      queueState.lastPushedCount = 0;
+      queueState.lastErrorCount = 0;
+      queueState.lastError = null;
+      queueState.lastRunAt = new Date().toISOString();
+      queueState.lastDurationMs = Date.now() - started;
+      return { projects: 0, pushed: 0, errors: 0 };
+    }
+
+    if (queueMirror === null) await loadQueueMirror();
+
+    const updates = {};
+    let errors = 0;
+    let lastErr = null;
+
+    await runPool(projects, QUEUE_CONCURRENCY, async (project) => {
+      try {
+        const newData = await fetchQueueProject(project);
+        const oldProject = queueMirror[project];
+
+        // Grafana eke me project ekata data ekak na
+        if (Object.keys(newData).length === 0) {
+          if (oldProject) updates[project] = null; // kalin thibuna data ain karanna
+          return;
+        }
+
+        const { merged, changed } = mergeQueueProject(oldProject, newData);
+        const heartbeatDue =
+          QUEUE_HEARTBEAT_SEC > 0 &&
+          Date.now() - (queueLastPush[project] || 0) >= QUEUE_HEARTBEAT_SEC * 1000;
+
+        if (changed || !oldProject || heartbeatDue) {
+          updates[project] = merged;
+        }
+      } catch (err) {
+        errors++;
+        lastErr = err.message;
+        console.error(`  ❌ [QUEUE] Error in ${project}:`, err.message);
+      }
+    });
+
+    // Server Projects eken ain karapu projects queue_monitor eken ain karanawa
+    const projectSet = new Set(projects);
+    for (const key of Object.keys(queueMirror)) {
+      if (!projectSet.has(key)) updates[key] = null;
+    }
+
+    const updateKeys = Object.keys(updates);
+    if (updateKeys.length > 0) {
+      await axios.patch(QUEUE_FIREBASE_URL, updates, { timeout: 30000 });
+
+      const now = Date.now();
+      let removed = 0;
+      for (const key of updateKeys) {
+        if (updates[key] === null) {
+          delete queueMirror[key];
+          delete queueLastPush[key];
+          removed++;
+        } else {
+          queueMirror[key] = updates[key];
+          queueLastPush[key] = now;
+        }
+      }
+      console.log(
+        `🚀 [QUEUE] Firebase updated: ${updateKeys.length - removed} project(s) pushed` +
+        (removed ? `, ${removed} removed` : "") +
+        (errors ? `, ${errors} error(s)` : "")
+      );
+    }
+
+    queueState.lastProjectCount = projects.length;
+    queueState.lastPushedCount = updateKeys.length;
+    queueState.lastErrorCount = errors;
+    queueState.lastError = lastErr;
+    queueState.lastRunAt = new Date().toISOString();
+    queueState.lastDurationMs = Date.now() - started;
+
+    return { projects: projects.length, pushed: updateKeys.length, errors };
+  } catch (err) {
+    queueState.lastError = err.message;
+    queueState.lastRunAt = new Date().toISOString();
+    queueState.lastDurationMs = Date.now() - started;
+    throw err;
+  } finally {
+    queueState.running = false;
+  }
+}
+
+function startQueueAutoLoop() {
+  if (!QUEUE_INTERVAL_SEC || QUEUE_INTERVAL_SEC <= 0) {
+    console.log("  ⏸️ [QUEUE] Auto refresh disabled (QUEUE_INTERVAL_SEC=0)");
+    return;
+  }
+  const loop = async () => {
+    try {
+      await runQueueCycle();
+    } catch (err) {
+      console.error("❌ [QUEUE] Cycle error:", err.message);
+    }
+    setTimeout(loop, QUEUE_INTERVAL_SEC * 1000);
+  };
+  loop();
+}
+
+/*
+|--------------------------------------------------------------------------
 | STAFF LOOKUP
 |--------------------------------------------------------------------------
 */
@@ -1185,7 +1599,7 @@ const server = http.createServer(async (req, res) => {
   const query = parsed.query;
 
   // /fetch-filtered saha /planning-ui walata Basic Auth oni na (kalin widihatama).
-  // Anith okkoma endpoints (/fetch-outflow ekath ekka) Basic Auth oni.
+  // Anith okkoma endpoints (/fetch-outflow, /queue-monitor/* ekath ekka) Basic Auth oni.
   const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
@@ -1203,10 +1617,11 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor)",
         time: new Date().toISOString(),
         cors: "enabled",
-        outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC
+        outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
+        queue_auto_interval_sec: QUEUE_INTERVAL_SEC
       }));
       return;
     }
@@ -1395,6 +1810,49 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // -------------------------------------------------------------
+    // MODE 6: QUEUE MONITOR
+    //   GET /queue-monitor/status   -> last run info + config
+    //   GET /queue-monitor/refresh  -> cycle ekak ekhama run karanawa
+    // -------------------------------------------------------------
+    if (pathname === "/queue-monitor/status" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        mode: "queue-monitor",
+        ...queueState,
+        config: {
+          interval_sec: QUEUE_INTERVAL_SEC,
+          concurrency: QUEUE_CONCURRENCY,
+          heartbeat_sec: QUEUE_HEARTBEAT_SEC,
+          projects_cache_sec: QUEUE_PROJECTS_CACHE_SEC,
+          projects_source: SERVER_PROJECTS_URL,
+          destination: QUEUE_FIREBASE_URL
+        },
+        projects: queueProjectsCache.list,
+        project_count: queueProjectsCache.list.length
+      }));
+      return;
+    }
+
+    if (pathname === "/queue-monitor/refresh" && req.method === "GET") {
+      if (queueState.running) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "A queue monitor cycle is already running" }));
+        return;
+      }
+      await getQueueProjects(true); // project list eka force refresh
+      const summary = await runQueueCycle();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        mode: "queue-monitor",
+        ...summary,
+        updated_at: new Date().toISOString()
+      }));
+      return;
+    }
+
     // Planning UI
     if (pathname === "/planning-ui" && req.method === "GET") {
       fs.readFile(PLANNING_HTML_PATH, "utf8", (err, html) => {
@@ -1567,6 +2025,8 @@ server.listen(PORT, HOST, () => {
   console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
   console.log(`     Planning     -> ${FIREBASE_PATH_PLANNING}`);
   console.log(`     Outflow      -> ${FIREBASE_OUTFLOW_URL} (today only)`);
+  console.log(`     Queue        -> ${QUEUE_FIREBASE_URL}`);
+  console.log(`     Queue source -> ${SERVER_PROJECTS_URL}`);
   console.log(`  📊 Endpoints (most accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
   console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
@@ -1577,6 +2037,8 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /fetch-outflow                     - Project outflow (today) -> project-gap.json`);
   console.log(`    GET  /fetch-outflow?range=yesterday|day_before|last_week   - past preset (not saved)`);
   console.log(`    GET  /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD          - custom range (not saved)`);
+  console.log(`    GET  /queue-monitor/status              - Queue monitor status`);
+  console.log(`    GET  /queue-monitor/refresh             - Run one queue monitor cycle now`);
   console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
   console.log(`    GET  /planning                          - List planning entries`);
   console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
@@ -1590,4 +2052,7 @@ server.listen(PORT, HOST, () => {
 
   // MODE 5 background auto-refresh (kalin standalone script eke loop eka wage)
   startOutflowAutoLoop();
+
+  // MODE 6 background queue monitor loop (Server Projects -> Grafana -> queue_monitor)
+  startQueueAutoLoop();
 });
