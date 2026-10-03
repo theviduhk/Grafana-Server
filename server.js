@@ -25,6 +25,9 @@ const path = require("path");
 | (allathwa waradi format eka dunnoth) default eka widihata "today" query
 | eka run wenawa.
 |
+| STAFF ID / TL ID matching is CASE-INSENSITIVE (g12345 / G12345 / k12345 ...
+| okkoma wada karanawa) - SQL eke UPPER(TRIM(...)) use karala.
+|
 | MODE 5 (/fetch-outflow) supports more:
 |   (none)                                   -> today   (also saved to Firebase)
 |   ?date=YYYY-MM-DD                         -> that single day
@@ -197,6 +200,24 @@ function buildDateRangeClause(dateStr) {
     return `event_timestamp BETWEEN TIMESTAMP('${dateStr} 00:00:00') AND TIMESTAMP('${dateStr} 23:59:59.999999')`;
   }
   return `event_timestamp BETWEEN TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY) AND CURRENT_TIMESTAMP()`;
+}
+
+/*
+|--------------------------------------------------------------------------
+| SQL STRING HELPERS
+|--------------------------------------------------------------------------
+| sqlEscape      -> backslash + single quote escape (SQL injection safe)
+| normalizeIdSql -> Staff ID / TL ID eka trim + UPPERCASE karanawa, e nisa
+|                   user g12345 / G12345 / k12345 / K12345 mokak type kalath
+|                   SQL eke UPPER(TRIM(column)) = '<UPPER VALUE>' match wenawa.
+|--------------------------------------------------------------------------
+*/
+function sqlEscape(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function normalizeIdSql(value) {
+  return sqlEscape(String(value).trim().toUpperCase());
 }
 
 /*
@@ -397,7 +418,8 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 |--------------------------------------------------------------------------
 */
 function buildQueryByTeamLeader(tlName, dateStr) {
-  const safeTl = String(tlName).replace(/'/g, "\\'");
+  // Case-insensitive + trimmed match (g26658-otl == G26658-OTL)
+  const safeTl = normalizeIdSql(tlName);
   const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
@@ -419,7 +441,7 @@ function buildQueryByTeamLeader(tlName, dateStr) {
         ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND team_leader_staff_id = '${safeTl}'
+        AND UPPER(TRIM(team_leader_staff_id)) = '${safeTl}'
       GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
@@ -428,7 +450,8 @@ function buildQueryByTeamLeader(tlName, dateStr) {
 }
 
 function buildQueryByStaffId(staffId, dateStr) {
-  const safeStaffId = String(staffId).replace(/'/g, "\\'");
+  // Case-insensitive + trimmed match (g12345 == G12345, k12345 == K12345)
+  const safeStaffId = normalizeIdSql(staffId);
   const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
@@ -450,7 +473,7 @@ function buildQueryByStaffId(staffId, dateStr) {
         ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND staff_id = '${safeStaffId}'
+        AND UPPER(TRIM(staff_id)) = '${safeStaffId}'
       GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
@@ -459,8 +482,8 @@ function buildQueryByStaffId(staffId, dateStr) {
 }
 
 function buildQueryByProjectTask(project, task, dateStr) {
-  const safeProject = String(project).replace(/'/g, "\\'");
-  const safeTask = String(task).replace(/'/g, "\\'");
+  const safeProject = sqlEscape(project);
+  const safeTask = sqlEscape(task);
   const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
