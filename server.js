@@ -28,6 +28,14 @@ const path = require("path");
 | STAFF ID / TL ID matching is CASE-INSENSITIVE (g12345 / G12345 / k12345 ...
 | okkoma wada karanawa) - SQL eke UPPER(TRIM(...)) use karala.
 |
+| *** NEW: PREFIX MATCHING ***
+| ID eka full widihata denna oni na. Udahanayak:
+|     G12345        -> G12345, G12345-OTL, G12345-QAQC ... okkoma match wenawa
+|     G12345-OTL    -> G12345-OTL witharak match wenawa
+|     G12345-QAQC   -> G12345-QAQC witharak match wenawa
+| (match eka "<ID>" exact HO "<ID>-" walin patan gannawa.) Ekai G123 kiyala
+| dunnama G12345 match wenne na - "-" eka passe thiyenna oni.
+|
 | MODE 5 (/fetch-outflow) supports more:
 |   (none)                                   -> today   (also saved to Firebase)
 |   ?date=YYYY-MM-DD                         -> that single day
@@ -209,7 +217,17 @@ function buildDateRangeClause(dateStr) {
 | sqlEscape      -> backslash + single quote escape (SQL injection safe)
 | normalizeIdSql -> Staff ID / TL ID eka trim + UPPERCASE karanawa, e nisa
 |                   user g12345 / G12345 / k12345 / K12345 mokak type kalath
-|                   SQL eke UPPER(TRIM(column)) = '<UPPER VALUE>' match wenawa.
+|                   match wenawa.
+| buildIdMatchSql-> PREFIX-AWARE matcher (NEW).
+|                   column = UPPER(TRIM(col))
+|                   match   = exact  HO  "<ID>-" walin patan gannawa
+|
+|   User type karapu "G12345"      -> G12345 / G12345-OTL / G12345-QAQC ...
+|   User type karapu "G12345-OTL"  -> G12345-OTL witharak
+|   User type karapu "G12345-QAQC" -> G12345-QAQC witharak
+|
+| STARTS_WITH use kala (LIKE nemei) - e nisa "_" "%" wage wildcard
+| characters walin awulak na.
 |--------------------------------------------------------------------------
 */
 function sqlEscape(value) {
@@ -218,6 +236,12 @@ function sqlEscape(value) {
 
 function normalizeIdSql(value) {
   return sqlEscape(String(value).trim().toUpperCase());
+}
+
+function buildIdMatchSql(column, value) {
+  const id = normalizeIdSql(value);
+  const col = `UPPER(TRIM(${column}))`;
+  return `(${col} = '${id}' OR STARTS_WITH(${col}, '${id}-'))`;
 }
 
 /*
@@ -418,8 +442,10 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 |--------------------------------------------------------------------------
 */
 function buildQueryByTeamLeader(tlName, dateStr) {
-  // Case-insensitive + trimmed match (g26658-otl == G26658-OTL)
-  const safeTl = normalizeIdSql(tlName);
+  // Case-insensitive + trimmed + PREFIX match:
+  //   "g26658"      -> G26658, G26658-OTL, G26658-QAQC ...
+  //   "g26658-otl"  -> G26658-OTL only
+  const idMatch = buildIdMatchSql("team_leader_staff_id", tlName);
   const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
@@ -441,7 +467,7 @@ function buildQueryByTeamLeader(tlName, dateStr) {
         ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND UPPER(TRIM(team_leader_staff_id)) = '${safeTl}'
+        AND ${idMatch}
       GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
@@ -450,8 +476,10 @@ function buildQueryByTeamLeader(tlName, dateStr) {
 }
 
 function buildQueryByStaffId(staffId, dateStr) {
-  // Case-insensitive + trimmed match (g12345 == G12345, k12345 == K12345)
-  const safeStaffId = normalizeIdSql(staffId);
+  // Case-insensitive + trimmed + PREFIX match:
+  //   "g12345"       -> G12345, G12345-OTL, G12345-QAQC ...
+  //   "g12345-qaqc"  -> G12345-QAQC only
+  const idMatch = buildIdMatchSql("staff_id", staffId);
   const dateClause = buildDateRangeClause(dateStr);
   return {
     query: `
@@ -473,7 +501,7 @@ function buildQueryByStaffId(staffId, dateStr) {
         ${dateClause}
         AND task_name    IS NOT NULL
         AND project_name IS NOT NULL
-        AND UPPER(TRIM(staff_id)) = '${safeStaffId}'
+        AND ${idMatch}
       GROUP BY 1, 2, 3, 4, 5
       ORDER BY timestamp
     `,
@@ -2050,6 +2078,7 @@ server.listen(PORT, HOST, () => {
   console.log(`     Outflow      -> ${FIREBASE_OUTFLOW_URL} (today only)`);
   console.log(`     Queue        -> ${QUEUE_FIREBASE_URL}`);
   console.log(`     Queue source -> ${SERVER_PROJECTS_URL}`);
+  console.log(`  🆔 ID matching: case-insensitive + prefix (G12345 -> G12345-OTL, G12345-QAQC ...)`);
   console.log(`  📊 Endpoints (most accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
   console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
