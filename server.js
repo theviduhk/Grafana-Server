@@ -8,45 +8,18 @@ const path = require("path");
 |--------------------------------------------------------------------------
 | CONFIG
 |--------------------------------------------------------------------------
-| Meka thani server ekakin thanku data 6ma type eka handle karanawa:
+| Meka thani server ekakin thanku data type 7ma handle karanawa:
 |   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
 |   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
 |   3. Project + Task filtered fetch             -> /qat_filtered.json
 |   4. Planning (project + task + target, multi) -> /planning.json
 |   5. Project Outflow (project | task | center) -> projectgap Firebase
-|                                                   Firebase /project-gap.json
 |   6. QUEUE MONITOR (Grafana queue total + oldest task, per project)
-|        -> https://thevindu-8fe8b-default-rtdb.firebaseio.com/queue_monitor
-|        Project list eka hardcode na. Firebase "Server Projects" node eken
-|        (qat-output DB) load wenawa, e nisa dashboard eken project add/remove
-|        kalama queue monitor ekatath auto apply wenawa.
+|   7. QAT CANCELLATIONS (cancellation records per Colombo day)
+|        -> https://cancellation-7294a-default-rtdb.firebaseio.com
 |
-| Modes 1-4 support optional `date=YYYY-MM-DD`. Date eka denne nathnam
-| (allathwa waradi format eka dunnoth) default eka widihata "today" query
-| eka run wenawa.
-|
-| STAFF ID / TL ID matching is CASE-INSENSITIVE (g12345 / G12345 / k12345 ...
-| okkoma wada karanawa) - SQL eke UPPER(TRIM(...)) use karala.
-|
-| *** NEW: PREFIX MATCHING ***
-| ID eka full widihata denna oni na. Udahanayak:
-|     G12345        -> G12345, G12345-OTL, G12345-QAQC ... okkoma match wenawa
-|     G12345-OTL    -> G12345-OTL witharak match wenawa
-|     G12345-QAQC   -> G12345-QAQC witharak match wenawa
-| (match eka "<ID>" exact HO "<ID>-" walin patan gannawa.) Ekai G123 kiyala
-| dunnama G12345 match wenne na - "-" eka passe thiyenna oni.
-|
-| MODE 5 (/fetch-outflow) supports more:
-|   (none)                                   -> today   (also saved to Firebase)
-|   ?date=YYYY-MM-DD                         -> that single day
-|   ?range=today|yesterday|day_before|last_week
-|   ?from=YYYY-MM-DD&to=YYYY-MM-DD           -> custom range (max 92 days)
-| Only "today" is written to Firebase (project-gap.json). Past dates / ranges
-| are returned to the caller only, so they can never overwrite today's data.
-|
-| MODE 6 (queue monitor) background loop eken auto run wenawa. Manual:
-|   GET /queue-monitor/status    -> last run info
-|   GET /queue-monitor/refresh   -> ekhama cycle ekak run karanawa
+| Modes 1-4 support optional `date=YYYY-MM-DD`.
+| STAFF ID / TL ID matching is CASE-INSENSITIVE + PREFIX aware.
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -60,38 +33,35 @@ const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
 const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
 const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning mode
 
-// MODE 5 (Outflow) - wenama Firebase database ekak, e nisa full URL eka.
+// MODE 5 (Outflow) - wenama Firebase database ekak
 const FIREBASE_OUTFLOW_URL =
   "https://projectgap-4b7d9-default-rtdb.firebaseio.com/project-gaps.json";
 
-// Outflow data eka background eken auto-refresh wena gaman (seconds).
-// Kalin script eke wage 10s. 0 dunnoth auto-refresh nawathinawa (manual
-// /fetch-outflow call witharak). Render env eken OUTFLOW_INTERVAL_SEC
-// widihata change karanna puluwan.
+// MODE 7 (Cancellations) - wenama Firebase database ekak
+const CANCELLATION_FIREBASE_BASE =
+  process.env.CANCELLATION_FIREBASE_BASE ||
+  "https://cancellation-7294a-default-rtdb.firebaseio.com";
+
+// Today's cancellations node (auto-refresh writes here)
+const CANCELLATION_TODAY_URL = `${CANCELLATION_FIREBASE_BASE}/cancellations.json`;
+
+// Day-specific archive node: /cancellations-by-date/YYYY-MM-DD.json
+const CANCELLATION_ARCHIVE_URL = (dateStr) =>
+  `${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/${dateStr}.json`;
+
+// Auto-refresh interval (seconds). 0 = disabled (manual /fetch-cancellations only)
+const CANCELLATION_AUTO_INTERVAL_SEC = Number(
+  process.env.CANCELLATION_INTERVAL_SEC ?? 60
+);
+
+// Outflow auto-refresh
 const OUTFLOW_AUTO_INTERVAL_SEC = Number(process.env.OUTFLOW_INTERVAL_SEC ?? 10);
-
-// Longest custom range /fetch-outflow will accept (days, inclusive).
 const OUTFLOW_MAX_RANGE_DAYS = Number(process.env.OUTFLOW_MAX_RANGE_DAYS ?? 92);
-
-// What "Previous Week" (range=last_week) means:
-//   "calendar" -> the last full Monday-Sunday week (default)
-//   "rolling"  -> the 7 days ending yesterday
 const PREVIOUS_WEEK_MODE = (process.env.PREVIOUS_WEEK_MODE || "calendar").toLowerCase();
 
 /*
 |--------------------------------------------------------------------------
 | MODE 6 CONFIG - QUEUE MONITOR
-|--------------------------------------------------------------------------
-| QUEUE_FIREBASE_URL        data push wenna thena (thevindu DB -> queue_monitor)
-| SERVER_PROJECTS_URL       project list eka ganna thena (qat-output DB ->
-|                           "Server Projects" node). Node eke nama wenas nam
-|                           SERVER_PROJECTS_PATH eka change karanna.
-| QUEUE_INTERVAL_SEC        cycle ekak iwara wela kiyada pasu next eka (0 = off)
-| QUEUE_CONCURRENCY         ekama welawata Grafana ekata yana request gana
-| QUEUE_HEARTBEAT_SEC       queue count wenas nowunath, duration (oldest task)
-|                           stale nowenna mekata parak project eka push karanawa
-|                           (0 = off)
-| QUEUE_PROJECTS_CACHE_SEC  Server Projects list eka cache karana kalaya
 |--------------------------------------------------------------------------
 */
 const QUEUE_FIREBASE_URL =
@@ -111,10 +81,41 @@ const QUEUE_CONCURRENCY = Math.max(1, Number(process.env.QUEUE_CONCURRENCY ?? 5)
 const QUEUE_HEARTBEAT_SEC = Number(process.env.QUEUE_HEARTBEAT_SEC ?? 60);
 const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 30);
 
-// planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
+/*
+|--------------------------------------------------------------------------
+| MODE 7 CONFIG - QAT CANCELLATIONS
+|--------------------------------------------------------------------------
+| EDIT these to match your real BigQuery table & column names.
+|
+| CANCELLATION_TABLE       fully qualified BQ table
+| CANCELLATION_COL_*       column names inside that table
+|
+| The COL_* values are what the endpoint response uses as JSON keys
+| (user, employee_name, project_name, task_name, probe_scene, cancel_reason,
+|  timestamp) so the frontend does not have to change.
+|--------------------------------------------------------------------------
+*/
+const CANCELLATION_TABLE =
+  process.env.CANCELLATION_TABLE ||
+  "trax-retail.backoffice.qat_cancellations";
+
+const CANCELLATION_COL = {
+  user:      process.env.CANCELLATION_COL_USER      || "user",
+  empName:   process.env.CANCELLATION_COL_EMP_NAME  || "employee_name",
+  project:   process.env.CANCELLATION_COL_PROJECT   || "project_name",
+  task:      process.env.CANCELLATION_COL_TASK      || "task_name",
+  probe:     process.env.CANCELLATION_COL_PROBE     || "probe_scene",
+  reason:    process.env.CANCELLATION_COL_REASON    || "cancel_reason",
+  timestamp: process.env.CANCELLATION_COL_TIMESTAMP || "event_timestamp",
+};
+
+// Colombo = UTC+05:30 -> +330 minutes
+const CANCELLATION_TZ_OFFSET_MIN = 330;
+
+// planning.html
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
 
-// Render port config (Render PORT env eken automatic set wenawa)
+// Render port
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
@@ -137,10 +138,6 @@ const PROJECT_TASK_SHEET_URL = () =>
 /*
 |--------------------------------------------------------------------------
 | CREDENTIALS
-|--------------------------------------------------------------------------
-| Env variables set karala thiyenawanam ewa use wenawa, nathnam kalin
-| thibba default values. Render dashboard eke Environment walata danna:
-|   AUTH_USER, AUTH_PASS, GRAFANA_USER, GRAFANA_PASS
 |--------------------------------------------------------------------------
 */
 const AUTH_USER = process.env.AUTH_USER || "admin";
@@ -187,7 +184,6 @@ function authenticate(req) {
 */
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-// Returns the same string if it is a real calendar date in YYYY-MM-DD form, else null.
 function parseYMD(raw) {
   const s = raw ? String(raw).trim() : "";
   if (!s || !DATE_RE.test(s)) return null;
@@ -203,6 +199,13 @@ function parseDateParam(query) {
   return parseYMD(query && query.date);
 }
 
+// "Today" in Asia/Colombo as YYYY-MM-DD
+function todayColombo() {
+  const now = new Date();
+  const colombo = new Date(now.getTime() + CANCELLATION_TZ_OFFSET_MIN * 60 * 1000);
+  return colombo.toISOString().slice(0, 10);
+}
+
 function buildDateRangeClause(dateStr) {
   if (dateStr) {
     return `event_timestamp BETWEEN TIMESTAMP('${dateStr} 00:00:00') AND TIMESTAMP('${dateStr} 23:59:59.999999')`;
@@ -213,21 +216,6 @@ function buildDateRangeClause(dateStr) {
 /*
 |--------------------------------------------------------------------------
 | SQL STRING HELPERS
-|--------------------------------------------------------------------------
-| sqlEscape      -> backslash + single quote escape (SQL injection safe)
-| normalizeIdSql -> Staff ID / TL ID eka trim + UPPERCASE karanawa, e nisa
-|                   user g12345 / G12345 / k12345 / K12345 mokak type kalath
-|                   match wenawa.
-| buildIdMatchSql-> PREFIX-AWARE matcher (NEW).
-|                   column = UPPER(TRIM(col))
-|                   match   = exact  HO  "<ID>-" walin patan gannawa
-|
-|   User type karapu "G12345"      -> G12345 / G12345-OTL / G12345-QAQC ...
-|   User type karapu "G12345-OTL"  -> G12345-OTL witharak
-|   User type karapu "G12345-QAQC" -> G12345-QAQC witharak
-|
-| STARTS_WITH use kala (LIKE nemei) - e nisa "_" "%" wage wildcard
-| characters walin awulak na.
 |--------------------------------------------------------------------------
 */
 function sqlEscape(value) {
@@ -247,9 +235,6 @@ function buildIdMatchSql(column, value) {
 /*
 |--------------------------------------------------------------------------
 | OUTFLOW DATE RANGE RESOLVER
-|--------------------------------------------------------------------------
-| All calendar maths is done in UTC, the same day boundary BigQuery's
-| CURRENT_DATE() uses for "today", so presets and today stay consistent.
 |--------------------------------------------------------------------------
 */
 function todayUTC() {
@@ -273,7 +258,6 @@ function daysBetweenInclusive(fromStr, toStr) {
   return Math.round((b - a) / 86400000) + 1;
 }
 
-// -> { key, from, to, isToday }  or  { error }
 function resolveOutflowRange(query) {
   const today = todayUTC();
   const todayStr = ymdUTC(today);
@@ -284,7 +268,6 @@ function resolveOutflowRange(query) {
   let key, from, to;
 
   if (fromRaw || toRaw) {
-    // Custom range: both ends required and valid
     const f = parseYMD(fromRaw);
     const t = parseYMD(toRaw);
     if (!f || !t) return { error: "from and to must both be valid YYYY-MM-DD dates" };
@@ -304,7 +287,7 @@ function resolveOutflowRange(query) {
         from = ymdUTC(addDaysUTC(today, -7));
         to = ymdUTC(addDaysUTC(today, -1));
       } else {
-        const sinceMonday = (today.getUTCDay() + 6) % 7; // Mon=0 ... Sun=6
+        const sinceMonday = (today.getUTCDay() + 6) % 7;
         const thisMonday = addDaysUTC(today, -sinceMonday);
         from = ymdUTC(addDaysUTC(thisMonday, -7));
         to = ymdUTC(addDaysUTC(thisMonday, -1));
@@ -313,7 +296,6 @@ function resolveOutflowRange(query) {
       return { error: "range must be one of: today, yesterday, day_before, last_week" };
     }
   } else if (query.date) {
-    // Backwards compatible single-day param
     const d = parseDateParam(query);
     if (!d) return { error: "date must be a valid YYYY-MM-DD date" };
     key = "date";
@@ -324,7 +306,7 @@ function resolveOutflowRange(query) {
   }
 
   if (from > todayStr) return { error: "The selected dates are in the future" };
-  if (to > todayStr) to = todayStr; // ranges can't run past today
+  if (to > todayStr) to = todayStr;
 
   const span = daysBetweenInclusive(from, to);
   if (span > OUTFLOW_MAX_RANGE_DAYS) {
@@ -336,7 +318,7 @@ function resolveOutflowRange(query) {
 
 /*
 |--------------------------------------------------------------------------
-| GRAFANA SESSION MANAGER (auto login + auto refresh on 401/403)
+| GRAFANA SESSION MANAGER
 |--------------------------------------------------------------------------
 */
 let grafanaSession = null;
@@ -424,8 +406,6 @@ async function grafanaRequest(method, reqUrl, data = null, retryCount = 0) {
 |--------------------------------------------------------------------------
 | BIGQUERY — poll until job complete
 |--------------------------------------------------------------------------
-| maxTries * 2s = max wait. Default 10 (20s). Range queries pass a bigger number.
-|--------------------------------------------------------------------------
 */
 async function getQueryResults(resultUrl, maxTries = 10) {
   for (let i = 0; i < maxTries; i++) {
@@ -438,13 +418,10 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 
 /*
 |--------------------------------------------------------------------------
-| BUILD SQL — variants (team leader / staff id / project+task / outflow)
+| BUILD SQL
 |--------------------------------------------------------------------------
 */
 function buildQueryByTeamLeader(tlName, dateStr) {
-  // Case-insensitive + trimmed + PREFIX match:
-  //   "g26658"      -> G26658, G26658-OTL, G26658-QAQC ...
-  //   "g26658-otl"  -> G26658-OTL only
   const idMatch = buildIdMatchSql("team_leader_staff_id", tlName);
   const dateClause = buildDateRangeClause(dateStr);
   return {
@@ -476,9 +453,6 @@ function buildQueryByTeamLeader(tlName, dateStr) {
 }
 
 function buildQueryByStaffId(staffId, dateStr) {
-  // Case-insensitive + trimmed + PREFIX match:
-  //   "g12345"       -> G12345, G12345-OTL, G12345-QAQC ...
-  //   "g12345-qaqc"  -> G12345-QAQC only
   const idMatch = buildIdMatchSql("staff_id", staffId);
   const dateClause = buildDateRangeClause(dateStr);
   return {
@@ -536,14 +510,6 @@ function buildQueryByProjectTask(project, task, dateStr) {
   };
 }
 
-// MODE 5: Project outflow (kalin standalone script eke query eka).
-// Kalin "CONCAT(project_name,' | ',task_name,' | ',center)" karala pasuwa
-// split karanawa wenuwata, dan columns 3ma wenama select karanawa - e nisa
-// project name ekaka " | " thibunath data waradi wenne na.
-//
-// fromStr / toStr = 'YYYY-MM-DD' (already validated by resolveOutflowRange, so safe to inline).
-// Both null -> today via CURRENT_DATE(). Output shape is identical for a day or a range:
-// values are summed per project / task / center over the whole range.
 function buildQueryOutflow(fromStr, toStr) {
   let dateClause;
   if (fromStr && toStr) {
@@ -565,6 +531,54 @@ function buildQueryOutflow(fromStr, toStr) {
       WHERE ${dateClause}
       GROUP BY 1, 2, 3
       ORDER BY value DESC
+    `,
+    useLegacySql: false,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| MODE 7: BUILD CANCELLATIONS SQL
+|--------------------------------------------------------------------------
+| Colombo day boundary -> UTC range. Example:
+|   Colombo 2025-01-15 00:00 = UTC 2025-01-14 18:30
+|   Colombo 2025-01-15 24:00 = UTC 2025-01-15 18:30
+|
+| Timestamp is returned as UNIX_MILLIS so frontend can do `new Date(ts)`.
+|--------------------------------------------------------------------------
+*/
+function buildQueryCancellations(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const colomboStartMs = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const utcStartMs = colomboStartMs - CANCELLATION_TZ_OFFSET_MIN * 60 * 1000;
+  const utcEndMs = utcStartMs + 24 * 60 * 60 * 1000;
+
+  const toIsoUtc = (ms) =>
+    new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+
+  const startIso = toIsoUtc(utcStartMs);
+  const endIso = toIsoUtc(utcEndMs);
+
+  const C = CANCELLATION_COL;
+
+  return {
+    query: `
+      #standardSQL
+      SELECT
+        ${C.user}      AS user,
+        ${C.empName}   AS employee_name,
+        ${C.project}   AS project_name,
+        ${C.task}      AS task_name,
+        ${C.probe}     AS probe_scene,
+        ${C.reason}    AS cancel_reason,
+        UNIX_MILLIS(${C.timestamp}) AS timestamp
+      FROM \`${CANCELLATION_TABLE}\`
+      WHERE ${C.timestamp} >= TIMESTAMP('${startIso}')
+        AND ${C.timestamp} <  TIMESTAMP('${endIso}')
+        AND ${C.reason} IS NOT NULL
+        AND TRIM(${C.reason}) != ''
+      ORDER BY ${C.timestamp} DESC
+      LIMIT 10000
     `,
     useLegacySql: false,
   };
@@ -624,7 +638,6 @@ function processResults(result) {
     });
 }
 
-// MODE 5 rows: { project, task, center, value }  (kalin script eke output shape eka)
 function processOutflowResults(result) {
   if (!result.rows) return [];
   const fields = result.schema.fields.map(f => f.name);
@@ -636,6 +649,26 @@ function processOutflowResults(result) {
       task: obj.task_name || "N/A",
       center: obj.center || "N/A",
       value: Number(obj.value || 0),
+    };
+  });
+}
+
+// MODE 7 rows: { user, employee_name, project_name, task_name,
+//                probe_scene, cancel_reason, timestamp }
+function processCancellationResults(result) {
+  if (!result.rows) return [];
+  const fields = result.schema.fields.map(f => f.name);
+  return result.rows.map(row => {
+    const obj = {};
+    row.f.forEach((cell, i) => { obj[fields[i]] = cell.v; });
+    return {
+      user:          String(obj.user || "").trim(),
+      employee_name: String(obj.employee_name || "").trim(),
+      project_name:  String(obj.project_name || "").trim(),
+      task_name:     String(obj.task_name || "").trim(),
+      probe_scene:   String(obj.probe_scene || "").trim(),
+      cancel_reason: String(obj.cancel_reason || "").trim(),
+      timestamp:     Number(obj.timestamp || 0),
     };
   });
 }
@@ -660,24 +693,26 @@ async function getFromFirebase(firebasePath) {
   }
 }
 
-// MODE 5 - wenama Firebase database ekata (project-gap.json) save karanawa
 async function saveOutflowToFirebase(payload) {
   await axios.put(FIREBASE_OUTFLOW_URL, payload, { timeout: 30000 });
   console.log("  🔥 Outflow Firebase updated (project-gap.json)");
 }
 
+// MODE 7 - save today's cancellations to cancellation Firebase
+async function saveCancellationsTodayToFirebase(payload) {
+  await axios.put(CANCELLATION_TODAY_URL, payload, { timeout: 30000 });
+  console.log(`  🔥 Cancellations saved to /cancellations.json (date=${payload.date})`);
+}
+
+// MODE 7 - archive a specific date
+async function saveCancellationsDateToFirebase(dateStr, payload) {
+  await axios.put(CANCELLATION_ARCHIVE_URL(dateStr), payload, { timeout: 30000 });
+  console.log(`  🔥 Cancellations archived to /cancellations-by-date/${dateStr}.json`);
+}
+
 /*
 |--------------------------------------------------------------------------
-| DENOMINATOR LOOKUP (normalized keys - lowercase + trimmed)
-|--------------------------------------------------------------------------
-| The published "Denominator Sheet" CSV (gid 822634964) actually contains
-| TWO independent tables side by side:
-|
-|   Table 1 "Denominator Sheet"  -> columns A:Y  (Project + task-name grid)
-|   Table 2 "UF Denominator"     -> columns AA:AD (Project, Task, Sub Task, Denominator)
-|
-| They are NOT row-aligned. Row 1 of the CSV is a merged title row - the
-| REAL column headers are on row 2, and data starts on row 3.
+| DENOMINATOR LOOKUP
 |--------------------------------------------------------------------------
 */
 const normKey = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
@@ -709,7 +744,6 @@ function ufKey(project, task, subtask) {
 
 const NON_TASK_HEADERS = new Set(['vlookup', 'region']);
 
-// Fixed column offsets of the UF Denominator table (columns AA:AD).
 const UF_COL_PROJECT = 26;
 const UF_COL_TASK = 27;
 const UF_COL_SUBTASK = 28;
@@ -718,7 +752,7 @@ const UF_COL_DENOMINATOR = 29;
 let denominatorCache = {
   data: null,
   timestamp: null,
-  cacheDuration: 5 * 60 * 1000 // 5 minutes
+  cacheDuration: 5 * 60 * 1000
 };
 
 async function fetchDenominatorSheet() {
@@ -749,7 +783,6 @@ async function fetchDenominatorSheet() {
     for (let i = 2; i < lines.length; i++) {
       const cells = splitLine(lines[i]);
 
-      // ---- Table 1: "Denominator Sheet" (project x task grid) ----
       const project = normKey(cells[0] || '');
       if (project) {
         for (let j = 1; j <= taskNames.length; j++) {
@@ -765,7 +798,6 @@ async function fetchDenominatorSheet() {
         }
       }
 
-      // ---- Table 2: "UF Denominator" (independent long-format table) ----
       const ufProject = (cells[UF_COL_PROJECT] || '').trim();
       const ufTask = (cells[UF_COL_TASK] || '').trim();
       const ufSubtask = (cells[UF_COL_SUBTASK] || '').trim();
@@ -807,7 +839,7 @@ async function getDenominatorData(forceRefresh = false) {
 
 /*
 |--------------------------------------------------------------------------
-| TASK FALLBACK GROUPS (sheet eke cell eka empty/"-" unoth)
+| TASK FALLBACK GROUPS
 |--------------------------------------------------------------------------
 */
 const TASK_FALLBACK_035 = new Set([
@@ -830,10 +862,6 @@ function taskFallback(normTask) {
   return 0;
 }
 
-// 1. exact task, subtask = Menu
-// 2. exact task, any other subtask
-// 3. equivalent task, subtask = Menu
-// 4. equivalent task, any other subtask
 function findUFDenominator(project, task, ufRowsByProject) {
   const rows = ufRowsByProject[normKey(project)];
   if (!rows || !rows.length) return undefined;
@@ -895,7 +923,6 @@ function lookupDenominator(project, task, denominatorData, templateName) {
   const normTask    = normKey(task);
   const ufRowsByProject = denominatorData.ufRowsByProject || {};
 
-  // PGES: "Repair Only" when template_name contains "display", else "Repair & Attribute".
   if (normProject === 'pges') {
     const subtask = normKey(templateName).includes('display') ? 'Repair Only' : 'Repair & Attribute';
     const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
@@ -918,7 +945,6 @@ function lookupDenominator(project, task, denominatorData, templateName) {
     if (ufValue !== undefined) return ufValue;
   }
 
-  // Fallback: main "Denominator Sheet" matrix, then the hardcoded fallback.
   const exactKey = `${normProject}||${normTask}`;
   if (denominatorData.byProjectTask[exactKey] !== undefined) {
     return denominatorData.byProjectTask[exactKey];
@@ -937,7 +963,7 @@ async function enrichWithDenominator(rows) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 1: Team Leader (team_leader_staff_id)
+| FETCH — MODE 1: Team Leader
 |--------------------------------------------------------------------------
 */
 async function fetchSingleTL(tlName, dateStr) {
@@ -972,7 +998,7 @@ async function fetchAllTeamLeaders(list, dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 2: Staff ID (staff_id)
+| FETCH — MODE 2: Staff ID
 |--------------------------------------------------------------------------
 */
 async function fetchSingleStaff(staffId, dateStr) {
@@ -1025,7 +1051,7 @@ async function fetchFilteredByProjectTask(project, task, dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 4: Planning (multiple project+task+target combos)
+| FETCH — MODE 4: Planning
 |--------------------------------------------------------------------------
 */
 async function fetchPlanningActual(entry, dateStr) {
@@ -1078,18 +1104,7 @@ async function refreshAllPlanning(dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 5: Project Outflow (project | task | center)
-|--------------------------------------------------------------------------
-| 560_project_outflow table eken project/task/center wise SUM(count) aran
-| denawa. fromStr/toStr null nam "today" (CURRENT_DATE()); nathnam e day
-| eka / range eka.
-|
-| Saved to Firebase (/project-gap.json) ONLY for today - see refreshOutflow().
-| Saved shape (kalin ekama):
-|   { lastUpdated, date, total_rows, data: [{ project, task, center, value }] }
-|
-| BigQuery result eka pages walata kadala enna puluwan, e nisa pageToken
-| thiyenakan ma ella pages ekathu karagannawa.
+| FETCH — MODE 5: Project Outflow
 |--------------------------------------------------------------------------
 */
 async function fetchOutflow(fromStr, toStr) {
@@ -1101,12 +1116,10 @@ async function fetchOutflow(fromStr, toStr) {
   const location = response.data.jobReference.location;
   const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
 
-  // Multi-day ranges scan more data, so allow the job longer to finish (30 x 2s = 60s)
   const isMultiDay = !!(fromStr && toStr && fromStr !== toStr);
   let result = await getQueryResults(resultUrl, isMultiDay ? 30 : 10);
   let rows = processOutflowResults(result);
 
-  // Extra pages (large result sets)
   let pageToken = result.pageToken;
   let pages = 1;
   while (pageToken && pages < 50) {
@@ -1124,11 +1137,8 @@ async function fetchOutflow(fromStr, toStr) {
   return rows;
 }
 
-// Overlap guard - aluth refresh ekak start wenna kalin kalin ekak iwara wela nathnam skip karanawa
 let outflowRunning = false;
 
-// TODAY only: fetch + write to Firebase (project-gap.json). Used by the auto loop and by
-// /fetch-outflow when the resolved range is today.
 async function refreshOutflow() {
   const rows = await fetchOutflow(null, null);
   const payload = {
@@ -1148,7 +1158,7 @@ async function autoRefreshOutflowOnce() {
   }
   outflowRunning = true;
   try {
-    await refreshOutflow(); // auto-refresh eka hemadama "today"
+    await refreshOutflow();
     console.log("✅ [OUTFLOW] Updated:", new Date().toLocaleTimeString());
   } catch (err) {
     console.error("❌ [OUTFLOW] Auto refresh error:", err.message);
@@ -1171,23 +1181,115 @@ function startOutflowAutoLoop() {
 
 /*
 |--------------------------------------------------------------------------
-| MODE 6: QUEUE MONITOR
+| FETCH — MODE 7: QAT CANCELLATIONS
 |--------------------------------------------------------------------------
-| Flow:
-|   1. "Server Projects" (qat-output Firebase) eken project list eka load
-|      karanawa  -> hardcode list eka nemei.
-|   2. Project hamadamata Grafana (datasource 29 /render) eken queue total +
-|      oldest task aran, metric 13 ekatama.
-|   3. Firebase eke thiyena eka samaga compare karala, wenas wela thiyena
-|      project witharak queue_monitor ekata PATCH karanawa. Count eka
-|      wenas wunama kalin value eka `previous` widihata save wenawa.
-|   4. Server Projects eken ain karapu project queue_monitor eken auto ain
-|      wenawa.
-|
-| Saved shape (project ekakata):
-|   queue_monitor/<project>/<metric name> = {
-|     current, duration, durationRaw, previous, lastUpdated
-|   }
+| Fetches every cancellation row for a given Colombo day and pushes it to
+| the cancellation Firebase DB. Today's data auto-refreshes on a timer;
+| past dates are only fetched on-demand (never overwrite today's node).
+|--------------------------------------------------------------------------
+*/
+async function fetchCancellations(dateStr) {
+  console.log(`\n>>> [CANCELLATIONS] Fetching cancellations... date="${dateStr}"`);
+  const query = buildQueryCancellations(dateStr);
+  const response = await grafanaRequest('POST', QUERY_URL, query);
+  const jobId = response.data.jobReference.jobId;
+  const location = response.data.jobReference.location;
+  const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
+
+  let result = await getQueryResults(resultUrl, 15);
+  let rows = processCancellationResults(result);
+
+  let pageToken = result.pageToken;
+  let pages = 1;
+  while (pageToken && pages < 20) {
+    const pageRes = await grafanaRequest(
+      'GET',
+      `${resultUrl}&pageToken=${encodeURIComponent(pageToken)}`
+    );
+    result = pageRes.data;
+    rows = rows.concat(processCancellationResults(result));
+    pageToken = result.pageToken;
+    pages++;
+  }
+
+  console.log(`  Rows found: ${rows.length}`);
+  return rows;
+}
+
+let cancellationRunning = false;
+
+// Fetch + write TODAY to Firebase (both /cancellations.json and archive)
+async function refreshCancellations() {
+  const dateStr = todayColombo();
+  const rows = await fetchCancellations(dateStr);
+
+  const payload = {
+    lastUpdated: new Date().toISOString(),
+    date: dateStr,
+    timezone: "Asia/Colombo",
+    total_rows: rows.length,
+    data: rows,
+  };
+
+  await saveCancellationsTodayToFirebase(payload);
+  // Also archive today's snapshot for historical lookups
+  await saveCancellationsDateToFirebase(dateStr, payload);
+
+  return payload;
+}
+
+// On-demand fetch for a specific date (past or today).
+// If it is today, also refresh the "today" node.
+async function refreshCancellationsForDate(dateStr) {
+  const rows = await fetchCancellations(dateStr);
+  const payload = {
+    lastUpdated: new Date().toISOString(),
+    date: dateStr,
+    timezone: "Asia/Colombo",
+    total_rows: rows.length,
+    data: rows,
+  };
+
+  await saveCancellationsDateToFirebase(dateStr, payload);
+
+  if (dateStr === todayColombo()) {
+    await saveCancellationsTodayToFirebase(payload);
+  }
+
+  return payload;
+}
+
+async function autoRefreshCancellationsOnce() {
+  if (cancellationRunning) {
+    console.log("  ⏭️ [CANCELLATIONS] Previous refresh still running, skipping this tick");
+    return;
+  }
+  cancellationRunning = true;
+  try {
+    await refreshCancellations();
+    console.log("✅ [CANCELLATIONS] Updated:", new Date().toLocaleTimeString());
+  } catch (err) {
+    console.error("❌ [CANCELLATIONS] Auto refresh error:", err.message);
+  } finally {
+    cancellationRunning = false;
+  }
+}
+
+function startCancellationsAutoLoop() {
+  if (!CANCELLATION_AUTO_INTERVAL_SEC || CANCELLATION_AUTO_INTERVAL_SEC <= 0) {
+    console.log("  ⏸️ [CANCELLATIONS] Auto refresh disabled (CANCELLATION_INTERVAL_SEC=0)");
+    return;
+  }
+  const loop = async () => {
+    await autoRefreshCancellationsOnce();
+    setTimeout(loop, CANCELLATION_AUTO_INTERVAL_SEC * 1000);
+  };
+  loop();
+}
+
+/*
+|--------------------------------------------------------------------------
+| MODE 6: QUEUE MONITOR
 |--------------------------------------------------------------------------
 */
 const QUEUE_METRICS = [
@@ -1206,11 +1308,8 @@ const QUEUE_METRICS = [
   { path: "offline_voting", name: "offline voting" }
 ];
 
-// Graphite path ekata dana nisa project name eka safe wenna oni
-// (dot eka path separator, quote eka alias eka kadanawa).
 const QUEUE_PROJECT_NAME_RE = /^[a-z0-9_-]+$/;
 
-// seconds -> human readable
 function formatDuration(seconds) {
   seconds = Math.floor(Number(seconds));
   if (isNaN(seconds)) return null;
@@ -1234,8 +1333,6 @@ function formatDuration(seconds) {
   return `${weeks}w ${remainingDays}d`;
 }
 
-// Grafana /render call (form-urlencoded). Shared session manager eka use karanawa.
-// Session expire unoth (401/403 ho JSON nemei response ekak) re-login karala retry.
 async function grafanaRender(body, retryCount = 0) {
   let usedSession = null;
   try {
@@ -1256,7 +1353,6 @@ async function grafanaRender(body, retryCount = 0) {
     const expired = status === 401 || status === 403 || error.badSession;
     if (expired && retryCount < 2) {
       console.warn("⚠️ [QUEUE] Session expired or invalid. Refreshing Grafana session...");
-      // Wena request ekak kalinma session eka refresh karala nam eka aye reset nokarana
       if (grafanaSession === usedSession) grafanaSession = null;
       return grafanaRender(body, retryCount + 1);
     }
@@ -1264,7 +1360,6 @@ async function grafanaRender(body, retryCount = 0) {
   }
 }
 
-// ---- Project list (Firebase "Server Projects") ----
 let queueProjectsCache = { list: [], ts: 0 };
 const queueWarnedNames = new Set();
 
@@ -1310,9 +1405,8 @@ async function getQueueProjects(force = false) {
   return list;
 }
 
-// ---- Firebase mirror (queue_monitor node eke current state eka) ----
-let queueMirror = null;          // null = aye load karanna oni
-const queueLastPush = {};        // project -> last push time (ms)
+let queueMirror = null;
+const queueLastPush = {};
 
 async function loadQueueMirror() {
   const res = await axios.get(QUEUE_FIREBASE_URL, { timeout: 30000 });
@@ -1320,7 +1414,6 @@ async function loadQueueMirror() {
   console.log(`  📥 [QUEUE] Loaded ${Object.keys(queueMirror).length} existing project(s) from Firebase`);
 }
 
-// ---- Fetch one project's queue numbers from Grafana ----
 async function fetchQueueProject(project) {
   const params = new URLSearchParams();
   for (const m of QUEUE_METRICS) {
@@ -1369,8 +1462,6 @@ async function fetchQueueProject(project) {
   return projectData;
 }
 
-// Old + new data merge karala, wenas wela thiyenawada kiyala balanawa.
-// "changed" = metric aluth / ain una / queue count eka wenas una.
 function mergeQueueProject(oldProject, newData) {
   const old = oldProject || {};
   const merged = {};
@@ -1403,7 +1494,6 @@ function mergeQueueProject(oldProject, newData) {
   return { merged, changed };
 }
 
-// Simple concurrency pool
 async function runPool(items, limit, worker) {
   let next = 0;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -1426,7 +1516,6 @@ const queueState = {
   lastError: null
 };
 
-// Cycle ekak: projects load -> Grafana fetch -> diff -> Firebase PATCH
 async function runQueueCycle() {
   if (queueState.running) return { skipped: true, reason: "previous cycle still running" };
 
@@ -1457,9 +1546,8 @@ async function runQueueCycle() {
         const newData = await fetchQueueProject(project);
         const oldProject = queueMirror[project];
 
-        // Grafana eke me project ekata data ekak na
         if (Object.keys(newData).length === 0) {
-          if (oldProject) updates[project] = null; // kalin thibuna data ain karanna
+          if (oldProject) updates[project] = null;
           return;
         }
 
@@ -1478,7 +1566,6 @@ async function runQueueCycle() {
       }
     });
 
-    // Server Projects eken ain karapu projects queue_monitor eken ain karanawa
     const projectSet = new Set(projects);
     for (const key of Object.keys(queueMirror)) {
       if (!projectSet.has(key)) updates[key] = null;
@@ -1558,7 +1645,7 @@ async function fetchStaffLookup() {
 
 /*
 |--------------------------------------------------------------------------
-| PROJECT/TASK LOOKUP (raw records)
+| PROJECT/TASK LOOKUP
 |--------------------------------------------------------------------------
 */
 async function fetchProjectTaskLookup() {
@@ -1631,7 +1718,7 @@ function readJsonBody(req) {
 
 /*
 |--------------------------------------------------------------------------
-| HTTP SERVER WITH CORS
+| HTTP SERVER
 |--------------------------------------------------------------------------
 */
 const server = http.createServer(async (req, res) => {
@@ -1649,8 +1736,6 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
   const query = parsed.query;
 
-  // /fetch-filtered saha /planning-ui walata Basic Auth oni na (kalin widihatama).
-  // Anith okkoma endpoints (/fetch-outflow, /queue-monitor/* ekath ekka) Basic Auth oni.
   const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
@@ -1668,18 +1753,18 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor)",
+        service: "QAT Server - Unified (TL / Staff / Filtered / Planning / Outflow / Queue / Cancellations)",
         time: new Date().toISOString(),
         cors: "enabled",
         outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
-        queue_auto_interval_sec: QUEUE_INTERVAL_SEC
+        queue_auto_interval_sec: QUEUE_INTERVAL_SEC,
+        cancellation_auto_interval_sec: CANCELLATION_AUTO_INTERVAL_SEC,
+        cancellation_firebase: CANCELLATION_FIREBASE_BASE,
       }));
       return;
     }
 
-    // -------------------------------------------------------------
-    // MODE 1: TEAM LEADER — /fetch-all?mode=tl&date=YYYY-MM-DD  (default mode)
-    // -------------------------------------------------------------
+    // MODE 1: TEAM LEADER — /fetch-all?mode=tl&date=YYYY-MM-DD
     if (pathname === "/fetch-all" && req.method === "GET" && (!query.mode || query.mode === "tl")) {
       const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
@@ -1702,9 +1787,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // -------------------------------------------------------------
     // MODE 2: STAFF ID — /fetch-all?mode=staff&date=YYYY-MM-DD
-    // -------------------------------------------------------------
     if (pathname === "/fetch-all" && req.method === "GET" && query.mode === "staff") {
       const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
@@ -1728,9 +1811,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // -------------------------------------------------------------
     // Single fetch — /fetch?tl_name=...  OR  /fetch?staff_id=...
-    // -------------------------------------------------------------
     if (pathname === "/fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
 
@@ -1779,9 +1860,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // -------------------------------------------------------------
-    // MODE 3: PROJECT + TASK FILTERED — /fetch-filtered?project=&task=&date=YYYY-MM-DD
-    // -------------------------------------------------------------
+    // MODE 3: PROJECT + TASK FILTERED
     if (pathname === "/fetch-filtered" && req.method === "GET") {
       const project = (query.project || "").trim();
       const task = (query.task || "").trim();
@@ -1815,16 +1894,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // -------------------------------------------------------------
     // MODE 5: PROJECT OUTFLOW
-    //   /fetch-outflow                                 -> today  (saved to Firebase)
-    //   /fetch-outflow?range=yesterday|day_before|last_week|today
-    //   /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD   -> custom range
-    //   /fetch-outflow?date=YYYY-MM-DD                 -> single day (legacy)
-    // Only "today" is written to Firebase (project-gap.json). Past dates / ranges
-    // are returned in the response only, so they never overwrite today's data.
-    // Response: { success, mode, range, date, from, to, rows, total, updated_at, saved_to_firebase }
-    // -------------------------------------------------------------
     if (pathname === "/fetch-outflow" && req.method === "GET") {
       const resolved = resolveOutflowRange(query);
       if (resolved.error) {
@@ -1837,11 +1907,11 @@ const server = http.createServer(async (req, res) => {
       let rows, updatedAt;
 
       if (isToday) {
-        const payload = await refreshOutflow(); // fetch + save to Firebase
+        const payload = await refreshOutflow();
         rows = payload.data;
         updatedAt = payload.lastUpdated;
       } else {
-        rows = await fetchOutflow(from, to); // fetch only, no Firebase write
+        rows = await fetchOutflow(from, to);
         updatedAt = new Date().toISOString();
       }
 
@@ -1862,10 +1932,77 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 6: QUEUE MONITOR
-    //   GET /queue-monitor/status   -> last run info + config
-    //   GET /queue-monitor/refresh  -> cycle ekak ekhama run karanawa
+    // MODE 7: QAT CANCELLATIONS
+    //   /fetch-cancellations                 -> today (Colombo), saved to Firebase
+    //   /fetch-cancellations?date=YYYY-MM-DD -> that Colombo day, saved (only
+    //                                           overwrites /cancellations.json
+    //                                           if the date is today)
     // -------------------------------------------------------------
+    if (pathname === "/fetch-cancellations" && req.method === "GET") {
+      const requested = parseDateParam(query);
+      const targetDate = requested || todayColombo();
+
+      // future date -> reject
+      if (targetDate > todayColombo()) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "Cannot fetch future dates" }));
+        return;
+      }
+
+      const payload =
+        targetDate === todayColombo()
+          ? await refreshCancellations()          // today: refresh today's node + archive
+          : await refreshCancellationsForDate(targetDate); // past: archive only
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        mode: "cancellations",
+        date: payload.date,
+        timezone: payload.timezone,
+        rows: payload.data,
+        total: payload.total_rows,
+        updated_at: payload.lastUpdated,
+        saved_to_firebase: true,
+        is_today: targetDate === todayColombo(),
+      }));
+      return;
+    }
+
+    // Read cancellations already stored in Firebase (today by default)
+    if (pathname === "/cancellations" && req.method === "GET") {
+      const requested = parseDateParam(query);
+      const targetDate = requested || todayColombo();
+      const readUrl =
+        targetDate === todayColombo()
+          ? CANCELLATION_TODAY_URL
+          : CANCELLATION_ARCHIVE_URL(targetDate);
+
+      try {
+        const r = await axios.get(readUrl, { timeout: 30000 });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          success: true,
+          mode: "cancellations-read",
+          date: targetDate,
+          source: readUrl,
+          payload: r.data || null,
+        }));
+      } catch (err) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          success: true,
+          mode: "cancellations-read",
+          date: targetDate,
+          source: readUrl,
+          payload: null,
+          note: "No data at that node yet",
+        }));
+      }
+      return;
+    }
+
+    // MODE 6: QUEUE MONITOR
     if (pathname === "/queue-monitor/status" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1892,7 +2029,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: "A queue monitor cycle is already running" }));
         return;
       }
-      await getQueueProjects(true); // project list eka force refresh
+      await getQueueProjects(true);
       const summary = await runQueueCycle();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1918,11 +2055,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // -------------------------------------------------------------
     // MODE 4: PLANNING
-    // -------------------------------------------------------------
-
-    // GET /planning  -> list every planning entry
     if (pathname === "/planning" && req.method === "GET") {
       const planningMap = (await getFromFirebase(FIREBASE_PATH_PLANNING)) || {};
       const list = Object.entries(planningMap).map(([id, entry]) => ({ id, ...entry }));
@@ -1931,7 +2064,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // POST /planning  -> add a new { project_name, task_name, target } entry
     if (pathname === "/planning" && req.method === "POST") {
       let body;
       try {
@@ -1967,7 +2099,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // DELETE /planning?id=xxx  -> remove a planning entry
     if (pathname === "/planning" && req.method === "DELETE") {
       const id = String(query.id || "").trim();
       if (!id) {
@@ -1981,7 +2112,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // GET /planning-fetch?date=YYYY-MM-DD
     if (pathname === "/planning-fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
       const updated = await refreshAllPlanning(dateStr);
@@ -2021,7 +2151,7 @@ const server = http.createServer(async (req, res) => {
     // Denominator lookup
     if (pathname === "/denominator-lookup" && req.method === "GET") {
       try {
-        const data = await getDenominatorData(true); // force refresh
+        const data = await getDenominatorData(true);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           success: true,
@@ -2071,40 +2201,43 @@ server.listen(PORT, HOST, () => {
   console.log(`  🔐 Basic Auth user: ${AUTH_USER}`);
   console.log(`  🌐 CORS: Enabled for all origins`);
   console.log(`  🔥 Firebase paths:`);
-  console.log(`     TL mode      -> ${FIREBASE_PATH_TL}`);
-  console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
-  console.log(`     Planning     -> ${FIREBASE_PATH_PLANNING}`);
-  console.log(`     Outflow      -> ${FIREBASE_OUTFLOW_URL} (today only)`);
-  console.log(`     Queue        -> ${QUEUE_FIREBASE_URL}`);
-  console.log(`     Queue source -> ${SERVER_PROJECTS_URL}`);
-  console.log(`  🆔 ID matching: case-insensitive + prefix (G12345 -> G12345-OTL, G12345-QAQC ...)`);
+  console.log(`     TL mode         -> ${FIREBASE_PATH_TL}`);
+  console.log(`     Staff mode      -> ${FIREBASE_PATH_STAFF}`);
+  console.log(`     Filtered        -> ${FIREBASE_PATH_FILTERED}`);
+  console.log(`     Planning        -> ${FIREBASE_PATH_PLANNING}`);
+  console.log(`     Outflow         -> ${FIREBASE_OUTFLOW_URL} (today only)`);
+  console.log(`     Queue           -> ${QUEUE_FIREBASE_URL}`);
+  console.log(`     Queue source    -> ${SERVER_PROJECTS_URL}`);
+  console.log(`     Cancellations   -> ${CANCELLATION_TODAY_URL} (today)`);
+  console.log(`     Cancellations*  -> ${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/<date>.json`);
+  console.log(`  🆔 ID matching: case-insensitive + prefix`);
   console.log(`  📊 Endpoints (most accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
-  console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
-  console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
-  console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
-  console.log(`    GET  /fetch-outflow                     - Project outflow (today) -> project-gap.json`);
-  console.log(`    GET  /fetch-outflow?range=yesterday|day_before|last_week   - past preset (not saved)`);
-  console.log(`    GET  /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD          - custom range (not saved)`);
+  console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders`);
+  console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids`);
+  console.log(`    GET  /fetch?tl_name=                    - Single TL fetch`);
+  console.log(`    GET  /fetch?staff_id=                   - Single staff fetch`);
+  console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered`);
+  console.log(`    GET  /fetch-outflow                     - Project outflow (today)`);
+  console.log(`    GET  /fetch-outflow?range=...           - Past preset (not saved)`);
+  console.log(`    GET  /fetch-outflow?from=&to=           - Custom range (not saved)`);
+  console.log(`    GET  /fetch-cancellations               - QAT cancellations (today)`);
+  console.log(`    GET  /fetch-cancellations?date=YYYY-MM-DD - QAT cancellations for a day`);
+  console.log(`    GET  /cancellations?date=YYYY-MM-DD     - Read stored cancellations`);
   console.log(`    GET  /queue-monitor/status              - Queue monitor status`);
-  console.log(`    GET  /queue-monitor/refresh             - Run one queue monitor cycle now`);
-  console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
+  console.log(`    GET  /queue-monitor/refresh             - Run one queue cycle now`);
+  console.log(`    GET  /planning-ui                       - Planning Tracker page`);
   console.log(`    GET  /planning                          - List planning entries`);
-  console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
-  console.log(`    DEL  /planning?id=                      - Remove a planning entry`);
-  console.log(`    GET  /planning-fetch                    - Refresh actual/% for all -> ${FIREBASE_PATH_PLANNING}`);
+  console.log(`    POST /planning                          - Add entry`);
+  console.log(`    DEL  /planning?id=                      - Remove entry`);
+  console.log(`    GET  /planning-fetch                    - Refresh actual/% for all`);
   console.log(`    GET  /staff-lookup                      - Staff name lookup`);
   console.log(`    GET  /project-task-lookup               - Project/Task lookup`);
   console.log(`    GET  /denominator-lookup                - Denominator lookup`);
   console.log(`    GET  /team-leaders | /staff-ids         - Default ID list`);
   console.log("================================");
 
-  // MODE 5 background auto-refresh (kalin standalone script eke loop eka wage)
   startOutflowAutoLoop();
-
-  // MODE 6 background queue monitor loop (Server Projects -> Grafana -> queue_monitor)
   startQueueAutoLoop();
+  startCancellationsAutoLoop();
 });
