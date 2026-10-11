@@ -75,22 +75,34 @@ const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 
 |--------------------------------------------------------------------------
 | MODE 7 CONFIG - QAT CANCELLATIONS
 |--------------------------------------------------------------------------
-| ⚠️ IMPORTANT: Verify these against your real BigQuery schema.
-| Use /debug-tables endpoint to find the actual table name and columns.
+| Table: trax-retail.backoffice.qat_cancelation_data
+|
+| ⚠️ Column names below are BEST GUESSES. If BigQuery returns
+|   "Unrecognized name" errors, override them via env vars:
+|
+|     CANCELLATION_COL_USER       = actual_column
+|     CANCELLATION_COL_EMP_NAME   = actual_column
+|     CANCELLATION_COL_PROJECT    = actual_column
+|     CANCELLATION_COL_TASK       = actual_column
+|     CANCELLATION_COL_PROBE      = actual_column
+|     CANCELLATION_COL_REASON     = actual_column
+|     CANCELLATION_COL_TIMESTAMP  = actual_column
+|
+| Or check the /debug-cancellations endpoint for the error.
 |--------------------------------------------------------------------------
 */
 const CANCELLATION_TABLE =
   process.env.CANCELLATION_TABLE ||
-  "trax-retail.backoffice.qat_cancellations";
+  "trax-retail.backoffice.qat_cancelation_data";
 
 const CANCELLATION_COL = {
-  user:      process.env.CANCELLATION_COL_USER      || "user",
-  empName:   process.env.CANCELLATION_COL_EMP_NAME  || "employee_name",
+  user:      process.env.CANCELLATION_COL_USER      || "user_id",
+  empName:   process.env.CANCELLATION_COL_EMP_NAME  || "user_name",
   project:   process.env.CANCELLATION_COL_PROJECT   || "project_name",
   task:      process.env.CANCELLATION_COL_TASK      || "task_name",
-  probe:     process.env.CANCELLATION_COL_PROBE     || "probe_scene",
-  reason:    process.env.CANCELLATION_COL_REASON    || "cancel_reason",
-  timestamp: process.env.CANCELLATION_COL_TIMESTAMP || "event_timestamp",
+  probe:     process.env.CANCELLATION_COL_PROBE     || "probe_id",
+  reason:    process.env.CANCELLATION_COL_REASON    || "cancelation_reason",
+  timestamp: process.env.CANCELLATION_COL_TIMESTAMP || "created_at",
 };
 
 const CANCELLATION_TZ_OFFSET_MIN = 330; // Asia/Colombo = UTC+05:30
@@ -542,8 +554,6 @@ function buildQueryCancellations(dateStr) {
       FROM \`${CANCELLATION_TABLE}\`
       WHERE ${C.timestamp} >= TIMESTAMP('${startIso}')
         AND ${C.timestamp} <  TIMESTAMP('${endIso}')
-        AND ${C.reason} IS NOT NULL
-        AND TRIM(${C.reason}) != ''
       ORDER BY ${C.timestamp} DESC
       LIMIT 10000
     `,
@@ -1698,80 +1708,47 @@ const server = http.createServer(async (req, res) => {
         cancellation_auto_interval_sec: CANCELLATION_AUTO_INTERVAL_SEC,
         cancellation_firebase: CANCELLATION_FIREBASE_BASE,
         cancellation_table: CANCELLATION_TABLE,
+        cancellation_columns: CANCELLATION_COL,
       }));
       return;
     }
 
-    // -------------------------------------------------------------
-    // DEBUG: list all BigQuery tables matching "cancel" in the name
-    //   /debug-tables
-    // -------------------------------------------------------------
-    if (pathname === "/debug-tables" && req.method === "GET") {
-      const queries = {
-        tablesBackoffice: `
-          SELECT table_name
-          FROM \`trax-retail.backoffice.INFORMATION_SCHEMA.TABLES\`
-          WHERE LOWER(table_name) LIKE '%cancel%'
-          ORDER BY table_name
-        `,
-        tablesAllDatasets: `
-          SELECT table_schema, table_name
-          FROM \`trax-retail.INFORMATION_SCHEMA.TABLES\`
-          WHERE LOWER(table_name) LIKE '%cancel%'
-          ORDER BY table_schema, table_name
-        `,
-        columnsBackoffice: `
-          SELECT table_name, column_name, data_type, ordinal_position
-          FROM \`trax-retail.backoffice.INFORMATION_SCHEMA.COLUMNS\`
-          WHERE LOWER(table_name) LIKE '%cancel%'
-          ORDER BY table_name, ordinal_position
-        `,
-        columnsAllDatasets: `
-          SELECT table_schema, table_name, column_name, data_type, ordinal_position
-          FROM \`trax-retail.INFORMATION_SCHEMA.COLUMNS\`
-          WHERE LOWER(table_name) LIKE '%cancel%'
-          ORDER BY table_schema, table_name, ordinal_position
-        `,
-      };
-
-      const out = {};
-      for (const [key, sql] of Object.entries(queries)) {
-        try {
-          const response = await grafanaRequest('POST', QUERY_URL, {
-            query: `#standardSQL\n${sql}`,
-            useLegacySql: false,
-          });
-          const jobId = response.data.jobReference.jobId;
-          const location = response.data.jobReference.location;
-          const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
-          const result = await getQueryResults(resultUrl, 15);
-          const fields = (result.schema && result.schema.fields || []).map(f => f.name);
-          out[key] = (result.rows || []).map(row => {
-            const o = {};
-            row.f.forEach((c, i) => { o[fields[i]] = c.v; });
-            return o;
-          });
-        } catch (e) {
-          out[key] = {
-            error: e.message,
-            status: e.response && e.response.status,
-            data: e.response && e.response.data,
-          };
-        }
-      }
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, result: out }, null, 2));
-      return;
-    }
-
-    // DEBUG: test a single cancellation query for a date
+    // DEBUG: list all columns of qat_cancelation_data
     if (pathname === "/debug-cancellations" && req.method === "GET") {
       const dateStr = parseDateParam(query) || todayColombo();
       const q = buildQueryCancellations(dateStr);
       let bigqueryError = null;
       let rowCount = null;
       let sampleRows = [];
+      let columnsProbe = null;
+
+      // First probe: list columns
+      try {
+        const colSql = `
+          SELECT column_name, data_type
+          FROM \`trax-retail.backoffice.INFORMATION_SCHEMA.COLUMNS\`
+          WHERE table_name = 'qat_cancelation_data'
+          ORDER BY ordinal_position
+        `;
+        const r = await grafanaRequest('POST', QUERY_URL, {
+          query: `#standardSQL\n${colSql}`,
+          useLegacySql: false,
+        });
+        const jid = r.data.jobReference.jobId;
+        const loc = r.data.jobReference.location;
+        const rurl = `${QUERY_URL}/${jid}?location=${loc}`;
+        const result = await getQueryResults(rurl, 15);
+        const fields = (result.schema?.fields || []).map(f => f.name);
+        columnsProbe = (result.rows || []).map(row => {
+          const o = {};
+          row.f.forEach((c, i) => { o[fields[i]] = c.v; });
+          return o;
+        });
+      } catch (e) {
+        columnsProbe = { error: e.message };
+      }
+
+      // Second probe: try the actual cancellation query
       try {
         const response = await grafanaRequest('POST', QUERY_URL, q);
         const jobId = response.data.jobReference.jobId;
@@ -1787,12 +1764,14 @@ const server = http.createServer(async (req, res) => {
           data: e.response && e.response.data,
         };
       }
+
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: !bigqueryError,
         date: dateStr,
         table: CANCELLATION_TABLE,
         columns: CANCELLATION_COL,
+        actualTableColumns: columnsProbe,
         sql: q.query,
         rowCount,
         sampleRows,
@@ -2212,6 +2191,10 @@ server.listen(PORT, HOST, () => {
   console.log(`     Cancellations   -> ${CANCELLATION_TODAY_URL}`);
   console.log(`     Cancellations*  -> ${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/<date>.json`);
   console.log(`  📊 Cancel table: ${CANCELLATION_TABLE}`);
+  console.log(`  📊 Cancel cols:`);
+  Object.entries(CANCELLATION_COL).forEach(([k, v]) => {
+    console.log(`       ${k.padEnd(10)} -> ${v}`);
+  });
   console.log("================================");
 
   startOutflowAutoLoop();
