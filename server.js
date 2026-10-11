@@ -8,18 +8,14 @@ const path = require("path");
 |--------------------------------------------------------------------------
 | CONFIG
 |--------------------------------------------------------------------------
-| Meka thani server ekakin thanku data type 7ma handle karanawa:
-|   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
-|   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
-|   3. Project + Task filtered fetch             -> /qat_filtered.json
-|   4. Planning (project + task + target, multi) -> /planning.json
-|   5. Project Outflow (project | task | center) -> projectgap Firebase
-|   6. QUEUE MONITOR (Grafana queue total + oldest task, per project)
-|   7. QAT CANCELLATIONS (cancellation records per Colombo day)
-|        -> https://cancellation-7294a-default-rtdb.firebaseio.com
-|
-| Modes 1-4 support optional `date=YYYY-MM-DD`.
-| STAFF ID / TL ID matching is CASE-INSENSITIVE + PREFIX aware.
+| Modes:
+|   1. Team Leader fetch        -> /TL Hourly.json
+|   2. Staff ID fetch           -> /QAT2 Output.json
+|   3. Project + Task filtered  -> /qat_filtered.json
+|   4. Planning                 -> /planning.json
+|   5. Project Outflow          -> projectgap Firebase
+|   6. Queue Monitor            -> thevindu Firebase
+|   7. QAT Cancellations        -> cancellation-7294a Firebase
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -27,34 +23,28 @@ const QUERY_URL =
 
 const FIREBASE_URL = "https://qat-output-default-rtdb.firebaseio.com";
 
-// Wenama Firebase path - features anuwa
-const FIREBASE_PATH_TL       = "/TL Hourly.json";     // Team Leader mode
-const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
-const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
-const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning mode
+const FIREBASE_PATH_TL       = "/TL Hourly.json";
+const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";
+const FIREBASE_PATH_FILTERED = "/qat_filtered.json";
+const FIREBASE_PATH_PLANNING = "/planning.json";
 
-// MODE 5 (Outflow) - wenama Firebase database ekak
 const FIREBASE_OUTFLOW_URL =
   "https://projectgap-4b7d9-default-rtdb.firebaseio.com/project-gaps.json";
 
-// MODE 7 (Cancellations) - wenama Firebase database ekak
+// MODE 7
 const CANCELLATION_FIREBASE_BASE =
   process.env.CANCELLATION_FIREBASE_BASE ||
   "https://cancellation-7294a-default-rtdb.firebaseio.com";
 
-// Today's cancellations node (auto-refresh writes here)
 const CANCELLATION_TODAY_URL = `${CANCELLATION_FIREBASE_BASE}/cancellations.json`;
 
-// Day-specific archive node: /cancellations-by-date/YYYY-MM-DD.json
 const CANCELLATION_ARCHIVE_URL = (dateStr) =>
   `${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/${dateStr}.json`;
 
-// Auto-refresh interval (seconds). 0 = disabled (manual /fetch-cancellations only)
 const CANCELLATION_AUTO_INTERVAL_SEC = Number(
   process.env.CANCELLATION_INTERVAL_SEC ?? 60
 );
 
-// Outflow auto-refresh
 const OUTFLOW_AUTO_INTERVAL_SEC = Number(process.env.OUTFLOW_INTERVAL_SEC ?? 10);
 const OUTFLOW_MAX_RANGE_DAYS = Number(process.env.OUTFLOW_MAX_RANGE_DAYS ?? 92);
 const PREVIOUS_WEEK_MODE = (process.env.PREVIOUS_WEEK_MODE || "calendar").toLowerCase();
@@ -85,14 +75,8 @@ const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 
 |--------------------------------------------------------------------------
 | MODE 7 CONFIG - QAT CANCELLATIONS
 |--------------------------------------------------------------------------
-| EDIT these to match your real BigQuery table & column names.
-|
-| CANCELLATION_TABLE       fully qualified BQ table
-| CANCELLATION_COL_*       column names inside that table
-|
-| The COL_* values are what the endpoint response uses as JSON keys
-| (user, employee_name, project_name, task_name, probe_scene, cancel_reason,
-|  timestamp) so the frontend does not have to change.
+| ⚠️ IMPORTANT: Verify these against your real BigQuery schema.
+| Use /debug-tables endpoint to find the actual table name and columns.
 |--------------------------------------------------------------------------
 */
 const CANCELLATION_TABLE =
@@ -109,17 +93,14 @@ const CANCELLATION_COL = {
   timestamp: process.env.CANCELLATION_COL_TIMESTAMP || "event_timestamp",
 };
 
-// Colombo = UTC+05:30 -> +330 minutes
-const CANCELLATION_TZ_OFFSET_MIN = 330;
+const CANCELLATION_TZ_OFFSET_MIN = 330; // Asia/Colombo = UTC+05:30
 
-// planning.html
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
+const CANCELLATIONS_HTML_PATH = path.join(__dirname, "cancellations.html");
 
-// Render port
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
-// Default Team Leader / Staff IDs list
 const TEAM_LEADERS = [
   "G26658-OTL",
   "G25883-OTL",
@@ -127,19 +108,12 @@ const TEAM_LEADERS = [
   "G23179-OTL"
 ];
 
-// Staff lookup sheet
 const STAFF_SHEET_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vTcJSktGEdHycbjqLx-YD7-V1DUCH462h64XxaiuyKv9iK6n2FXgh6VAYvFEkS83DI76b2HJfppeuzd/pub?gid=1860286382&output=csv";
 
-// Project/Task lookup sheet (denominator matrix source)
 const PROJECT_TASK_SHEET_URL = () =>
   `https://docs.google.com/spreadsheets/d/e/2PACX-1vTcJSktGEdHycbjqLx-YD7-V1DUCH462h64XxaiuyKv9iK6n2FXgh6VAYvFEkS83DI76b2HJfppeuzd/pub?gid=822634964&output=csv&_=${Date.now()}`;
 
-/*
-|--------------------------------------------------------------------------
-| CREDENTIALS
-|--------------------------------------------------------------------------
-*/
 const AUTH_USER = process.env.AUTH_USER || "admin";
 const AUTH_PASS = process.env.AUTH_PASS || "password123";
 const GRAFANA_USER = process.env.GRAFANA_USER || "gss.kurunegala@gssintl.biz";
@@ -199,7 +173,6 @@ function parseDateParam(query) {
   return parseYMD(query && query.date);
 }
 
-// "Today" in Asia/Colombo as YYYY-MM-DD
 function todayColombo() {
   const now = new Date();
   const colombo = new Date(now.getTime() + CANCELLATION_TZ_OFFSET_MIN * 60 * 1000);
@@ -215,7 +188,7 @@ function buildDateRangeClause(dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| SQL STRING HELPERS
+| SQL HELPERS
 |--------------------------------------------------------------------------
 */
 function sqlEscape(value) {
@@ -540,12 +513,6 @@ function buildQueryOutflow(fromStr, toStr) {
 |--------------------------------------------------------------------------
 | MODE 7: BUILD CANCELLATIONS SQL
 |--------------------------------------------------------------------------
-| Colombo day boundary -> UTC range. Example:
-|   Colombo 2025-01-15 00:00 = UTC 2025-01-14 18:30
-|   Colombo 2025-01-15 24:00 = UTC 2025-01-15 18:30
-|
-| Timestamp is returned as UNIX_MILLIS so frontend can do `new Date(ts)`.
-|--------------------------------------------------------------------------
 */
 function buildQueryCancellations(dateStr) {
   const [y, m, d] = dateStr.split("-").map(Number);
@@ -653,8 +620,6 @@ function processOutflowResults(result) {
   });
 }
 
-// MODE 7 rows: { user, employee_name, project_name, task_name,
-//                probe_scene, cancel_reason, timestamp }
 function processCancellationResults(result) {
   if (!result.rows) return [];
   const fields = result.schema.fields.map(f => f.name);
@@ -695,16 +660,14 @@ async function getFromFirebase(firebasePath) {
 
 async function saveOutflowToFirebase(payload) {
   await axios.put(FIREBASE_OUTFLOW_URL, payload, { timeout: 30000 });
-  console.log("  🔥 Outflow Firebase updated (project-gap.json)");
+  console.log("  🔥 Outflow Firebase updated");
 }
 
-// MODE 7 - save today's cancellations to cancellation Firebase
 async function saveCancellationsTodayToFirebase(payload) {
   await axios.put(CANCELLATION_TODAY_URL, payload, { timeout: 30000 });
   console.log(`  🔥 Cancellations saved to /cancellations.json (date=${payload.date})`);
 }
 
-// MODE 7 - archive a specific date
 async function saveCancellationsDateToFirebase(dateStr, payload) {
   await axios.put(CANCELLATION_ARCHIVE_URL(dateStr), payload, { timeout: 30000 });
   console.log(`  🔥 Cancellations archived to /cancellations-by-date/${dateStr}.json`);
@@ -1152,10 +1115,7 @@ async function refreshOutflow() {
 }
 
 async function autoRefreshOutflowOnce() {
-  if (outflowRunning) {
-    console.log("  ⏭️ [OUTFLOW] Previous refresh still running, skipping this tick");
-    return;
-  }
+  if (outflowRunning) return;
   outflowRunning = true;
   try {
     await refreshOutflow();
@@ -1169,7 +1129,7 @@ async function autoRefreshOutflowOnce() {
 
 function startOutflowAutoLoop() {
   if (!OUTFLOW_AUTO_INTERVAL_SEC || OUTFLOW_AUTO_INTERVAL_SEC <= 0) {
-    console.log("  ⏸️ [OUTFLOW] Auto refresh disabled (OUTFLOW_INTERVAL_SEC=0)");
+    console.log("  ⏸️ [OUTFLOW] Auto refresh disabled");
     return;
   }
   const loop = async () => {
@@ -1182,10 +1142,6 @@ function startOutflowAutoLoop() {
 /*
 |--------------------------------------------------------------------------
 | FETCH — MODE 7: QAT CANCELLATIONS
-|--------------------------------------------------------------------------
-| Fetches every cancellation row for a given Colombo day and pushes it to
-| the cancellation Firebase DB. Today's data auto-refreshes on a timer;
-| past dates are only fetched on-demand (never overwrite today's node).
 |--------------------------------------------------------------------------
 */
 async function fetchCancellations(dateStr) {
@@ -1218,7 +1174,6 @@ async function fetchCancellations(dateStr) {
 
 let cancellationRunning = false;
 
-// Fetch + write TODAY to Firebase (both /cancellations.json and archive)
 async function refreshCancellations() {
   const dateStr = todayColombo();
   const rows = await fetchCancellations(dateStr);
@@ -1232,14 +1187,11 @@ async function refreshCancellations() {
   };
 
   await saveCancellationsTodayToFirebase(payload);
-  // Also archive today's snapshot for historical lookups
   await saveCancellationsDateToFirebase(dateStr, payload);
 
   return payload;
 }
 
-// On-demand fetch for a specific date (past or today).
-// If it is today, also refresh the "today" node.
 async function refreshCancellationsForDate(dateStr) {
   const rows = await fetchCancellations(dateStr);
   const payload = {
@@ -1260,10 +1212,7 @@ async function refreshCancellationsForDate(dateStr) {
 }
 
 async function autoRefreshCancellationsOnce() {
-  if (cancellationRunning) {
-    console.log("  ⏭️ [CANCELLATIONS] Previous refresh still running, skipping this tick");
-    return;
-  }
+  if (cancellationRunning) return;
   cancellationRunning = true;
   try {
     await refreshCancellations();
@@ -1277,7 +1226,7 @@ async function autoRefreshCancellationsOnce() {
 
 function startCancellationsAutoLoop() {
   if (!CANCELLATION_AUTO_INTERVAL_SEC || CANCELLATION_AUTO_INTERVAL_SEC <= 0) {
-    console.log("  ⏸️ [CANCELLATIONS] Auto refresh disabled (CANCELLATION_INTERVAL_SEC=0)");
+    console.log("  ⏸️ [CANCELLATIONS] Auto refresh disabled");
     return;
   }
   const loop = async () => {
@@ -1392,7 +1341,7 @@ async function getQueueProjects(force = false) {
       if (!QUEUE_PROJECT_NAME_RE.test(name)) {
         if (!queueWarnedNames.has(name)) {
           queueWarnedNames.add(name);
-          console.warn(`  ⚠️ [QUEUE] Skipping invalid project name in Server Projects: "${raw}"`);
+          console.warn(`  ⚠️ [QUEUE] Skipping invalid project name: "${raw}"`);
         }
         continue;
       }
@@ -1525,11 +1474,7 @@ async function runQueueCycle() {
   try {
     const projects = await getQueueProjects();
     if (!projects.length) {
-      console.log("  ⚠️ [QUEUE] No projects found in Server Projects - nothing to monitor");
-      queueState.lastProjectCount = 0;
-      queueState.lastPushedCount = 0;
-      queueState.lastErrorCount = 0;
-      queueState.lastError = null;
+      console.log("  ⚠️ [QUEUE] No projects found");
       queueState.lastRunAt = new Date().toISOString();
       queueState.lastDurationMs = Date.now() - started;
       return { projects: 0, pushed: 0, errors: 0 };
@@ -1614,7 +1559,7 @@ async function runQueueCycle() {
 
 function startQueueAutoLoop() {
   if (!QUEUE_INTERVAL_SEC || QUEUE_INTERVAL_SEC <= 0) {
-    console.log("  ⏸️ [QUEUE] Auto refresh disabled (QUEUE_INTERVAL_SEC=0)");
+    console.log("  ⏸️ [QUEUE] Auto refresh disabled");
     return;
   }
   const loop = async () => {
@@ -1630,7 +1575,7 @@ function startQueueAutoLoop() {
 
 /*
 |--------------------------------------------------------------------------
-| STAFF LOOKUP
+| STAFF / PROJECT-TASK LOOKUP
 |--------------------------------------------------------------------------
 */
 async function fetchStaffLookup() {
@@ -1643,14 +1588,8 @@ async function fetchStaffLookup() {
   }
 }
 
-/*
-|--------------------------------------------------------------------------
-| PROJECT/TASK LOOKUP
-|--------------------------------------------------------------------------
-*/
 async function fetchProjectTaskLookup() {
   try {
-    console.log("📊 Fetching project/task lookup data...");
     const response = await axios.get(PROJECT_TASK_SHEET_URL(), {
       responseType: 'text',
       timeout: 30000
@@ -1674,10 +1613,8 @@ async function fetchProjectTaskLookup() {
       records.push(record);
     }
 
-    console.log(`✅ Loaded ${records.length} project/task lookup records`);
     return records;
   } catch (err) {
-    console.error("❌ Failed to fetch project/task lookup:", err.message);
     throw new Error("Failed to fetch project/task sheet: " + err.message);
   }
 }
@@ -1736,7 +1673,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
   const query = parsed.query;
 
-  const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
+  const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui", "/cancellations-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
     res.writeHead(401, {
@@ -1753,18 +1690,118 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff / Filtered / Planning / Outflow / Queue / Cancellations)",
+        service: "QAT Server - Unified",
         time: new Date().toISOString(),
         cors: "enabled",
         outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
         queue_auto_interval_sec: QUEUE_INTERVAL_SEC,
         cancellation_auto_interval_sec: CANCELLATION_AUTO_INTERVAL_SEC,
         cancellation_firebase: CANCELLATION_FIREBASE_BASE,
+        cancellation_table: CANCELLATION_TABLE,
       }));
       return;
     }
 
-    // MODE 1: TEAM LEADER — /fetch-all?mode=tl&date=YYYY-MM-DD
+    // -------------------------------------------------------------
+    // DEBUG: list all BigQuery tables matching "cancel" in the name
+    //   /debug-tables
+    // -------------------------------------------------------------
+    if (pathname === "/debug-tables" && req.method === "GET") {
+      const queries = {
+        tablesBackoffice: `
+          SELECT table_name
+          FROM \`trax-retail.backoffice.INFORMATION_SCHEMA.TABLES\`
+          WHERE LOWER(table_name) LIKE '%cancel%'
+          ORDER BY table_name
+        `,
+        tablesAllDatasets: `
+          SELECT table_schema, table_name
+          FROM \`trax-retail.INFORMATION_SCHEMA.TABLES\`
+          WHERE LOWER(table_name) LIKE '%cancel%'
+          ORDER BY table_schema, table_name
+        `,
+        columnsBackoffice: `
+          SELECT table_name, column_name, data_type, ordinal_position
+          FROM \`trax-retail.backoffice.INFORMATION_SCHEMA.COLUMNS\`
+          WHERE LOWER(table_name) LIKE '%cancel%'
+          ORDER BY table_name, ordinal_position
+        `,
+        columnsAllDatasets: `
+          SELECT table_schema, table_name, column_name, data_type, ordinal_position
+          FROM \`trax-retail.INFORMATION_SCHEMA.COLUMNS\`
+          WHERE LOWER(table_name) LIKE '%cancel%'
+          ORDER BY table_schema, table_name, ordinal_position
+        `,
+      };
+
+      const out = {};
+      for (const [key, sql] of Object.entries(queries)) {
+        try {
+          const response = await grafanaRequest('POST', QUERY_URL, {
+            query: `#standardSQL\n${sql}`,
+            useLegacySql: false,
+          });
+          const jobId = response.data.jobReference.jobId;
+          const location = response.data.jobReference.location;
+          const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
+          const result = await getQueryResults(resultUrl, 15);
+          const fields = (result.schema && result.schema.fields || []).map(f => f.name);
+          out[key] = (result.rows || []).map(row => {
+            const o = {};
+            row.f.forEach((c, i) => { o[fields[i]] = c.v; });
+            return o;
+          });
+        } catch (e) {
+          out[key] = {
+            error: e.message,
+            status: e.response && e.response.status,
+            data: e.response && e.response.data,
+          };
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, result: out }, null, 2));
+      return;
+    }
+
+    // DEBUG: test a single cancellation query for a date
+    if (pathname === "/debug-cancellations" && req.method === "GET") {
+      const dateStr = parseDateParam(query) || todayColombo();
+      const q = buildQueryCancellations(dateStr);
+      let bigqueryError = null;
+      let rowCount = null;
+      let sampleRows = [];
+      try {
+        const response = await grafanaRequest('POST', QUERY_URL, q);
+        const jobId = response.data.jobReference.jobId;
+        const location = response.data.jobReference.location;
+        const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
+        const result = await getQueryResults(resultUrl, 15);
+        rowCount = (result.rows || []).length;
+        sampleRows = processCancellationResults(result).slice(0, 3);
+      } catch (e) {
+        bigqueryError = {
+          message: e.message,
+          status: e.response && e.response.status,
+          data: e.response && e.response.data,
+        };
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: !bigqueryError,
+        date: dateStr,
+        table: CANCELLATION_TABLE,
+        columns: CANCELLATION_COL,
+        sql: q.query,
+        rowCount,
+        sampleRows,
+        bigqueryError,
+      }, null, 2));
+      return;
+    }
+
+    // MODE 1: TEAM LEADER
     if (pathname === "/fetch-all" && req.method === "GET" && (!query.mode || query.mode === "tl")) {
       const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
@@ -1777,17 +1814,14 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "tl",
-        date: dateStr || "today",
-        data: allData,
-        total_leaders: allData.length,
+        success: true, mode: "tl", date: dateStr || "today",
+        data: allData, total_leaders: allData.length,
         updated_at: new Date().toISOString()
       }));
       return;
     }
 
-    // MODE 2: STAFF ID — /fetch-all?mode=staff&date=YYYY-MM-DD
+    // MODE 2: STAFF ID
     if (pathname === "/fetch-all" && req.method === "GET" && query.mode === "staff") {
       const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
@@ -1800,18 +1834,15 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "staff",
-        date: dateStr || "today",
-        data: allData,
-        total_leaders: allData.length,
+        success: true, mode: "staff", date: dateStr || "today",
+        data: allData, total_leaders: allData.length,
         staff_ids: requestedIds.length ? requestedIds : TEAM_LEADERS,
         updated_at: new Date().toISOString()
       }));
       return;
     }
 
-    // Single fetch — /fetch?tl_name=...  OR  /fetch?staff_id=...
+    // Single fetch
     if (pathname === "/fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
 
@@ -1827,12 +1858,8 @@ const server = http.createServer(async (req, res) => {
         });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          success: true,
-          mode: "staff",
-          date: dateStr || "today",
-          rows: data.rows,
-          total: data.total_rows,
-          staff_id: staffId,
+          success: true, mode: "staff", date: dateStr || "today",
+          rows: data.rows, total: data.total_rows, staff_id: staffId,
           updated_at: new Date().toISOString(),
         }));
         return;
@@ -1849,18 +1876,14 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "tl",
-        date: dateStr || "today",
-        rows: data.rows,
-        total: data.total_rows,
-        tl_name: tlName,
+        success: true, mode: "tl", date: dateStr || "today",
+        rows: data.rows, total: data.total_rows, tl_name: tlName,
         updated_at: new Date().toISOString(),
       }));
       return;
     }
 
-    // MODE 3: PROJECT + TASK FILTERED
+    // MODE 3: FILTERED
     if (pathname === "/fetch-filtered" && req.method === "GET") {
       const project = (query.project || "").trim();
       const task = (query.task || "").trim();
@@ -1882,19 +1905,14 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "filtered",
-        date: dateStr || "today",
-        rows,
-        total: rows.length,
-        project,
-        task,
+        success: true, mode: "filtered", date: dateStr || "today",
+        rows, total: rows.length, project, task,
         updated_at: new Date().toISOString(),
       }));
       return;
     }
 
-    // MODE 5: PROJECT OUTFLOW
+    // MODE 5: OUTFLOW
     if (pathname === "/fetch-outflow" && req.method === "GET") {
       const resolved = resolveOutflowRange(query);
       if (resolved.error) {
@@ -1917,32 +1935,19 @@ const server = http.createServer(async (req, res) => {
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "outflow",
-        range: key,
+        success: true, mode: "outflow", range: key,
         date: isToday ? "today" : (from === to ? from : `${from}..${to}`),
-        from,
-        to,
-        rows,
-        total: rows.length,
-        updated_at: updatedAt,
+        from, to, rows, total: rows.length, updated_at: updatedAt,
         saved_to_firebase: isToday,
       }));
       return;
     }
 
-    // -------------------------------------------------------------
-    // MODE 7: QAT CANCELLATIONS
-    //   /fetch-cancellations                 -> today (Colombo), saved to Firebase
-    //   /fetch-cancellations?date=YYYY-MM-DD -> that Colombo day, saved (only
-    //                                           overwrites /cancellations.json
-    //                                           if the date is today)
-    // -------------------------------------------------------------
+    // MODE 7: CANCELLATIONS
     if (pathname === "/fetch-cancellations" && req.method === "GET") {
       const requested = parseDateParam(query);
       const targetDate = requested || todayColombo();
 
-      // future date -> reject
       if (targetDate > todayColombo()) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: false, error: "Cannot fetch future dates" }));
@@ -1951,17 +1956,14 @@ const server = http.createServer(async (req, res) => {
 
       const payload =
         targetDate === todayColombo()
-          ? await refreshCancellations()          // today: refresh today's node + archive
-          : await refreshCancellationsForDate(targetDate); // past: archive only
+          ? await refreshCancellations()
+          : await refreshCancellationsForDate(targetDate);
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "cancellations",
-        date: payload.date,
-        timezone: payload.timezone,
-        rows: payload.data,
-        total: payload.total_rows,
+        success: true, mode: "cancellations",
+        date: payload.date, timezone: payload.timezone,
+        rows: payload.data, total: payload.total_rows,
         updated_at: payload.lastUpdated,
         saved_to_firebase: true,
         is_today: targetDate === todayColombo(),
@@ -1969,7 +1971,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Read cancellations already stored in Firebase (today by default)
+    // Read cancellations from Firebase
     if (pathname === "/cancellations" && req.method === "GET") {
       const requested = parseDateParam(query);
       const targetDate = requested || todayColombo();
@@ -1982,20 +1984,14 @@ const server = http.createServer(async (req, res) => {
         const r = await axios.get(readUrl, { timeout: 30000 });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          success: true,
-          mode: "cancellations-read",
-          date: targetDate,
-          source: readUrl,
-          payload: r.data || null,
+          success: true, mode: "cancellations-read",
+          date: targetDate, source: readUrl, payload: r.data || null,
         }));
       } catch (err) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          success: true,
-          mode: "cancellations-read",
-          date: targetDate,
-          source: readUrl,
-          payload: null,
+          success: true, mode: "cancellations-read",
+          date: targetDate, source: readUrl, payload: null,
           note: "No data at that node yet",
         }));
       }
@@ -2006,8 +2002,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/queue-monitor/status" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "queue-monitor",
+        success: true, mode: "queue-monitor",
         ...queueState,
         config: {
           interval_sec: QUEUE_INTERVAL_SEC,
@@ -2033,9 +2028,7 @@ const server = http.createServer(async (req, res) => {
       const summary = await runQueueCycle();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        mode: "queue-monitor",
-        ...summary,
+        success: true, mode: "queue-monitor", ...summary,
         updated_at: new Date().toISOString()
       }));
       return;
@@ -2046,7 +2039,21 @@ const server = http.createServer(async (req, res) => {
       fs.readFile(PLANNING_HTML_PATH, "utf8", (err, html) => {
         if (err) {
           res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "planning.html not found next to server.js: " + err.message }));
+          res.end(JSON.stringify({ error: "planning.html not found: " + err.message }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+      });
+      return;
+    }
+
+    // Cancellations UI
+    if (pathname === "/cancellations-ui" && req.method === "GET") {
+      fs.readFile(CANCELLATIONS_HTML_PATH, "utf8", (err, html) => {
+        if (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "cancellations.html not found: " + err.message }));
           return;
         }
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -2086,11 +2093,8 @@ const server = http.createServer(async (req, res) => {
 
       const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       const entry = {
-        project_name,
-        task_name,
-        target,
-        actual: 0,
-        percentage: 0,
+        project_name, task_name, target,
+        actual: 0, percentage: 0,
         created_at: new Date().toISOString(),
       };
       await axios.put(`${FIREBASE_URL}/planning/${id}.json`, entry);
@@ -2118,10 +2122,8 @@ const server = http.createServer(async (req, res) => {
       const list = Object.entries(updated).map(([id, entry]) => ({ id, ...entry }));
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: true,
-        date: dateStr || "today",
-        data: list,
-        count: list.length,
+        success: true, date: dateStr || "today",
+        data: list, count: list.length,
         updated_at: new Date().toISOString(),
       }));
       return;
@@ -2154,8 +2156,7 @@ const server = http.createServer(async (req, res) => {
         const data = await getDenominatorData(true);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          success: true,
-          data,
+          success: true, data,
           count: {
             byProjectTask: Object.keys(data.byProjectTask).length,
             byGID: Object.keys(data.byGID).length,
@@ -2169,7 +2170,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Default staff/TL id list
+    // Default ID list
     if ((pathname === "/team-leaders" || pathname === "/staff-ids") && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -2208,33 +2209,9 @@ server.listen(PORT, HOST, () => {
   console.log(`     Outflow         -> ${FIREBASE_OUTFLOW_URL} (today only)`);
   console.log(`     Queue           -> ${QUEUE_FIREBASE_URL}`);
   console.log(`     Queue source    -> ${SERVER_PROJECTS_URL}`);
-  console.log(`     Cancellations   -> ${CANCELLATION_TODAY_URL} (today)`);
+  console.log(`     Cancellations   -> ${CANCELLATION_TODAY_URL}`);
   console.log(`     Cancellations*  -> ${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/<date>.json`);
-  console.log(`  🆔 ID matching: case-insensitive + prefix`);
-  console.log(`  📊 Endpoints (most accept optional &date=YYYY-MM-DD):`);
-  console.log(`    GET  /                                  - Health check`);
-  console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders`);
-  console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids`);
-  console.log(`    GET  /fetch?tl_name=                    - Single TL fetch`);
-  console.log(`    GET  /fetch?staff_id=                   - Single staff fetch`);
-  console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered`);
-  console.log(`    GET  /fetch-outflow                     - Project outflow (today)`);
-  console.log(`    GET  /fetch-outflow?range=...           - Past preset (not saved)`);
-  console.log(`    GET  /fetch-outflow?from=&to=           - Custom range (not saved)`);
-  console.log(`    GET  /fetch-cancellations               - QAT cancellations (today)`);
-  console.log(`    GET  /fetch-cancellations?date=YYYY-MM-DD - QAT cancellations for a day`);
-  console.log(`    GET  /cancellations?date=YYYY-MM-DD     - Read stored cancellations`);
-  console.log(`    GET  /queue-monitor/status              - Queue monitor status`);
-  console.log(`    GET  /queue-monitor/refresh             - Run one queue cycle now`);
-  console.log(`    GET  /planning-ui                       - Planning Tracker page`);
-  console.log(`    GET  /planning                          - List planning entries`);
-  console.log(`    POST /planning                          - Add entry`);
-  console.log(`    DEL  /planning?id=                      - Remove entry`);
-  console.log(`    GET  /planning-fetch                    - Refresh actual/% for all`);
-  console.log(`    GET  /staff-lookup                      - Staff name lookup`);
-  console.log(`    GET  /project-task-lookup               - Project/Task lookup`);
-  console.log(`    GET  /denominator-lookup                - Denominator lookup`);
-  console.log(`    GET  /team-leaders | /staff-ids         - Default ID list`);
+  console.log(`  📊 Cancel table: ${CANCELLATION_TABLE}`);
   console.log("================================");
 
   startOutflowAutoLoop();
