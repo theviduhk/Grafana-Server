@@ -126,9 +126,9 @@ const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 
 | MODE 7 CONFIG - CANCELLATION
 |--------------------------------------------------------------------------
 | CANCELLATION_FIREBASE_URL  data save wenna thena (cancellation-7294a DB)
-| CANCEL_STAFF_COLUMN        table eke staff id column eka (default staff_id)
+| CANCEL_STAFF_COLUMN        table eke staff id column eka (default user)
 | CANCEL_DATE_COLUMN         table eke date/timestamp column eka
-|                            (default event_timestamp)
+|                            (default timestamp, DATE type)
 | Column names mokakda kiyala /cancellation-columns eken balala, wenas nam
 | Render env eke mema variables set karanna.
 |--------------------------------------------------------------------------
@@ -138,8 +138,8 @@ const CANCELLATION_FIREBASE_URL =
   "https://cancellation-7294a-default-rtdb.firebaseio.com/qat_cancelation_data.json";
 
 const CANCEL_TABLE = "trax-retail.backoffice.qat_cancelation_data";
-const CANCEL_STAFF_COLUMN = process.env.CANCEL_STAFF_COLUMN || "staff_id";
-const CANCEL_DATE_COLUMN = process.env.CANCEL_DATE_COLUMN || "event_timestamp";
+const CANCEL_STAFF_COLUMN = process.env.CANCEL_STAFF_COLUMN || "user";
+const CANCEL_DATE_COLUMN = process.env.CANCEL_DATE_COLUMN || "timestamp";
 // Column name eka safe da kiyala check (SQL injection walakwanna)
 const COLUMN_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -612,16 +612,16 @@ function buildQueryCancellation(staffIds, dateStr) {
   const conditions = [];
 
   if (staffIds && staffIds.length) {
-    const idClauses = staffIds.map(id => buildIdMatchSql(CANCEL_STAFF_COLUMN, id));
+    const idClauses = staffIds.map(id => buildIdMatchSql("`" + CANCEL_STAFF_COLUMN + "`", id));
     conditions.push(`(${idClauses.join(" OR ")})`);
   }
   if (dateStr) {
-    conditions.push(`DATE(${CANCEL_DATE_COLUMN}) = DATE('${dateStr}')`);
+    conditions.push(`DATE(\`${CANCEL_DATE_COLUMN}\`) = DATE('${dateStr}')`);
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   return {
-    query: `#standardSQL\nSELECT * FROM \`${CANCEL_TABLE}\` ${where}`,
+    query: `#standardSQL\nSELECT * FROM \`${CANCEL_TABLE}\` ${where} ORDER BY \`${CANCEL_DATE_COLUMN}\``,
     useLegacySql: false,
   };
 }
@@ -1251,7 +1251,13 @@ function startOutflowAutoLoop() {
 |--------------------------------------------------------------------------
 */
 async function runBigQuery(query, maxTries = 30) {
-  const response = await grafanaRequest('POST', QUERY_URL, query);
+  let response;
+  try {
+    response = await grafanaRequest('POST', QUERY_URL, query);
+  } catch (err) {
+    const bq = err.response && err.response.data && err.response.data.error;
+    throw new Error(bq && bq.message ? `BigQuery: ${bq.message}` : err.message);
+  }
   const { jobId, location } = response.data.jobReference;
   const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
 
