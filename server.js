@@ -6,16 +6,7 @@ const path = require("path");
 
 /*
 |--------------------------------------------------------------------------
-| CONFIG
-|--------------------------------------------------------------------------
-| Modes:
-|   1. Team Leader fetch        -> /TL Hourly.json
-|   2. Staff ID fetch           -> /QAT2 Output.json
-|   3. Project + Task filtered  -> /qat_filtered.json
-|   4. Planning                 -> /planning.json
-|   5. Project Outflow          -> projectgap Firebase
-|   6. Queue Monitor            -> thevindu Firebase
-|   7. QAT Cancellations        -> cancellation-7294a Firebase
+| CONFIG — Modes 1-7
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -37,7 +28,6 @@ const CANCELLATION_FIREBASE_BASE =
   "https://cancellation-7294a-default-rtdb.firebaseio.com";
 
 const CANCELLATION_TODAY_URL = `${CANCELLATION_FIREBASE_BASE}/cancellations.json`;
-
 const CANCELLATION_ARCHIVE_URL = (dateStr) =>
   `${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/${dateStr}.json`;
 
@@ -73,22 +63,22 @@ const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 
 
 /*
 |--------------------------------------------------------------------------
-| MODE 7 CONFIG - QAT CANCELLATIONS
+| MODE 7 CONFIG — QAT CANCELLATIONS
 |--------------------------------------------------------------------------
 | Table: trax-retail.backoffice.qat_cancelation_data
-|
-| ⚠️ Column names below are BEST GUESSES. If BigQuery returns
-|   "Unrecognized name" errors, override them via env vars:
-|
-|     CANCELLATION_COL_USER       = actual_column
-|     CANCELLATION_COL_EMP_NAME   = actual_column
-|     CANCELLATION_COL_PROJECT    = actual_column
-|     CANCELLATION_COL_TASK       = actual_column
-|     CANCELLATION_COL_PROBE      = actual_column
-|     CANCELLATION_COL_REASON     = actual_column
-|     CANCELLATION_COL_TIMESTAMP  = actual_column
-|
-| Or check the /debug-cancellations endpoint for the error.
+| Columns (confirmed):
+|   project_name       STRING
+|   timestamp          DATE
+|   probe_id           INT64
+|   scene_id           INT64
+|   email              STRING
+|   user               STRING
+|   task_name          STRING
+|   shift_event_name   STRING
+|   task_uuid          STRING
+|   cancel_reason      STRING
+|   trax_category_group_id INT64
+|   trax_category_in_group STRING
 |--------------------------------------------------------------------------
 */
 const CANCELLATION_TABLE =
@@ -96,16 +86,17 @@ const CANCELLATION_TABLE =
   "trax-retail.backoffice.qat_cancelation_data";
 
 const CANCELLATION_COL = {
-  user:      process.env.CANCELLATION_COL_USER      || "user_id",
-  empName:   process.env.CANCELLATION_COL_EMP_NAME  || "user_name",
+  user:      process.env.CANCELLATION_COL_USER      || "user",
+  email:     process.env.CANCELLATION_COL_EMAIL     || "email",
   project:   process.env.CANCELLATION_COL_PROJECT   || "project_name",
   task:      process.env.CANCELLATION_COL_TASK      || "task_name",
   probe:     process.env.CANCELLATION_COL_PROBE     || "probe_id",
-  reason:    process.env.CANCELLATION_COL_REASON    || "cancelation_reason",
-  timestamp: process.env.CANCELLATION_COL_TIMESTAMP || "created_at",
+  scene:     process.env.CANCELLATION_COL_SCENE     || "scene_id",
+  reason:    process.env.CANCELLATION_COL_REASON    || "cancel_reason",
+  timestamp: process.env.CANCELLATION_COL_TIMESTAMP || "timestamp",
 };
 
-const CANCELLATION_TZ_OFFSET_MIN = 330; // Asia/Colombo = UTC+05:30
+const CANCELLATION_TZ_OFFSET_MIN = 330;
 
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
 const CANCELLATIONS_HTML_PATH = path.join(__dirname, "cancellations.html");
@@ -114,10 +105,7 @@ const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
 const TEAM_LEADERS = [
-  "G26658-OTL",
-  "G25883-OTL",
-  "G22371-OTL",
-  "G23179-OTL"
+  "G26658-OTL", "G25883-OTL", "G22371-OTL", "G23179-OTL"
 ];
 
 const STAFF_SHEET_URL =
@@ -403,7 +391,7 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 
 /*
 |--------------------------------------------------------------------------
-| BUILD SQL
+| BUILD SQL — Team Leader / Staff / Filtered / Outflow
 |--------------------------------------------------------------------------
 */
 function buildQueryByTeamLeader(tlName, dateStr) {
@@ -414,20 +402,11 @@ function buildQueryByTeamLeader(tlName, dateStr) {
       #standardSQL
       SELECT
         TIMESTAMP_TRUNC(event_timestamp, HOUR) AS timestamp,
-        project_name,
-        task_name,
-        staff_id,
-        template_name,
-        SUM(
-          CASE
-            WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
-            ELSE count
-          END
-        ) AS value
+        project_name, task_name, staff_id, template_name,
+        SUM(CASE WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes ELSE count END) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
-      WHERE
-        ${dateClause}
-        AND task_name    IS NOT NULL
+      WHERE ${dateClause}
+        AND task_name IS NOT NULL
         AND project_name IS NOT NULL
         AND ${idMatch}
       GROUP BY 1, 2, 3, 4, 5
@@ -445,20 +424,11 @@ function buildQueryByStaffId(staffId, dateStr) {
       #standardSQL
       SELECT
         TIMESTAMP_TRUNC(event_timestamp, HOUR) AS timestamp,
-        project_name,
-        task_name,
-        staff_id,
-        template_name,
-        SUM(
-          CASE
-            WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
-            ELSE count
-          END
-        ) AS value
+        project_name, task_name, staff_id, template_name,
+        SUM(CASE WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes ELSE count END) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
-      WHERE
-        ${dateClause}
-        AND task_name    IS NOT NULL
+      WHERE ${dateClause}
+        AND task_name IS NOT NULL
         AND project_name IS NOT NULL
         AND ${idMatch}
       GROUP BY 1, 2, 3, 4, 5
@@ -477,14 +447,10 @@ function buildQueryByProjectTask(project, task, dateStr) {
       #standardSQL
       SELECT
         TIMESTAMP_TRUNC(event_timestamp, HOUR) AS timestamp,
-        project_name,
-        task_name,
-        staff_id,
-        template_name,
+        project_name, task_name, staff_id, template_name,
         SUM(count) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
-      WHERE
-        ${dateClause}
+      WHERE ${dateClause}
         AND task_name IS NOT NULL
         AND project_name = '${safeProject}'
         AND task_name    = '${safeTask}'
@@ -507,11 +473,7 @@ function buildQueryOutflow(fromStr, toStr) {
   return {
     query: `
       #standardSQL
-      SELECT
-        project_name,
-        task_name,
-        center,
-        SUM(count) AS value
+      SELECT project_name, task_name, center, SUM(count) AS value
       FROM \`trax-retail.backoffice.560_project_outflow\`
       WHERE ${dateClause}
       GROUP BY 1, 2, 3
@@ -525,36 +487,28 @@ function buildQueryOutflow(fromStr, toStr) {
 |--------------------------------------------------------------------------
 | MODE 7: BUILD CANCELLATIONS SQL
 |--------------------------------------------------------------------------
+| timestamp is DATE — no timezone conversion needed.
+| We convert to UNIX millis so the frontend can do new Date(ts).
+| employee_name is derived from email (part before '@').
+|--------------------------------------------------------------------------
 */
 function buildQueryCancellations(dateStr) {
-  const [y, m, d] = dateStr.split("-").map(Number);
-  const colomboStartMs = Date.UTC(y, m - 1, d, 0, 0, 0);
-  const utcStartMs = colomboStartMs - CANCELLATION_TZ_OFFSET_MIN * 60 * 1000;
-  const utcEndMs = utcStartMs + 24 * 60 * 60 * 1000;
-
-  const toIsoUtc = (ms) =>
-    new Date(ms).toISOString().replace("T", " ").slice(0, 19);
-
-  const startIso = toIsoUtc(utcStartMs);
-  const endIso = toIsoUtc(utcEndMs);
-
   const C = CANCELLATION_COL;
 
   return {
     query: `
       #standardSQL
       SELECT
-        ${C.user}      AS user,
-        ${C.empName}   AS employee_name,
-        ${C.project}   AS project_name,
-        ${C.task}      AS task_name,
-        ${C.probe}     AS probe_scene,
-        ${C.reason}    AS cancel_reason,
-        UNIX_MILLIS(${C.timestamp}) AS timestamp
+        \`${C.user}\` AS user,
+        SPLIT(${C.email}, '@')[OFFSET(0)] AS employee_name,
+        ${C.project} AS project_name,
+        ${C.task} AS task_name,
+        CAST(${C.probe} AS STRING) AS probe_scene,
+        ${C.reason} AS cancel_reason,
+        UNIX_MILLIS(TIMESTAMP(${C.timestamp})) AS timestamp
       FROM \`${CANCELLATION_TABLE}\`
-      WHERE ${C.timestamp} >= TIMESTAMP('${startIso}')
-        AND ${C.timestamp} <  TIMESTAMP('${endIso}')
-      ORDER BY ${C.timestamp} DESC
+      WHERE ${C.timestamp} = DATE('${dateStr}')
+      ORDER BY \`${C.user}\`
       LIMIT 10000
     `,
     useLegacySql: false,
@@ -569,11 +523,7 @@ function buildQueryCancellations(dateStr) {
 const normKeySimple = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
 
 const TEMPLATE_NAME_TASKS = new Set([
-  'voting_engine',
-  'offline_validation',
-  'voting',
-  'validation',
-  'offline_voting'
+  'voting_engine', 'offline_validation', 'voting', 'validation', 'offline_voting'
 ]);
 
 function isTemplateNameTask(taskName) {
@@ -716,7 +666,6 @@ function ufKey(project, task, subtask) {
 }
 
 const NON_TASK_HEADERS = new Set(['vlookup', 'region']);
-
 const UF_COL_PROJECT = 26;
 const UF_COL_TASK = 27;
 const UF_COL_SUBTASK = 28;
@@ -788,7 +737,7 @@ async function fetchDenominatorSheet() {
       }
     }
 
-    console.log(`✅ Loaded ${Object.keys(denominatorMap.byProjectTask).length} project/task denominators, ${Object.keys(denominatorMap.uf).length} UF denominator rows`);
+    console.log(`✅ Loaded ${Object.keys(denominatorMap.byProjectTask).length} project/task denominators, ${Object.keys(denominatorMap.uf).length} UF rows`);
     return denominatorMap;
   } catch (err) {
     console.error("❌ Failed to fetch denominator sheet:", err.message);
@@ -810,16 +759,9 @@ async function getDenominatorData(forceRefresh = false) {
   return data;
 }
 
-/*
-|--------------------------------------------------------------------------
-| TASK FALLBACK GROUPS
-|--------------------------------------------------------------------------
-*/
 const TASK_FALLBACK_035 = new Set([
-  'offline_posm', 'posm_masking', 'posm_voting',
-  'stitching', 'stitching_edit',
-  'scene_recognition', 'scene_recognition_edit',
-  'validation_warm_up'
+  'offline_posm', 'posm_masking', 'posm_voting', 'stitching', 'stitching_edit',
+  'scene_recognition', 'scene_recognition_edit', 'validation_warm_up'
 ]);
 
 const TASK_FALLBACK_1 = new Set([
@@ -1057,10 +999,7 @@ async function refreshAllPlanning(dateStr) {
       try {
         const { actual, percentage, staff_breakdown } = await fetchPlanningActual(entry, dateStr);
         updated[id] = {
-          ...entry,
-          actual,
-          percentage,
-          staff_breakdown,
+          ...entry, actual, percentage, staff_breakdown,
           date: dateStr || "today",
           last_fetched_at: new Date().toISOString(),
         };
@@ -1272,21 +1211,16 @@ const QUEUE_PROJECT_NAME_RE = /^[a-z0-9_-]+$/;
 function formatDuration(seconds) {
   seconds = Math.floor(Number(seconds));
   if (isNaN(seconds)) return null;
-
   if (seconds < 60) return `${seconds}s`;
-
   const minutes = Math.floor(seconds / 60);
   const secs = seconds % 60;
   if (minutes < 60) return `${minutes}m ${secs}s`;
-
   const hours = Math.floor(minutes / 60);
   const mins = minutes % 60;
   if (hours < 24) return `${hours}h ${mins}m`;
-
   const days = Math.floor(hours / 24);
   const hrs = hours % 24;
   if (days < 7) return `${days}d ${hrs}h`;
-
   const weeks = Math.floor(days / 7);
   const remainingDays = days % 7;
   return `${weeks}w ${remainingDays}d`;
@@ -1324,11 +1258,8 @@ const queueWarnedNames = new Set();
 
 async function getQueueProjects(force = false) {
   const now = Date.now();
-  if (
-    !force &&
-    queueProjectsCache.ts &&
-    now - queueProjectsCache.ts < QUEUE_PROJECTS_CACHE_SEC * 1000
-  ) {
+  if (!force && queueProjectsCache.ts &&
+      now - queueProjectsCache.ts < QUEUE_PROJECTS_CACHE_SEC * 1000) {
     return queueProjectsCache.list;
   }
 
@@ -1339,15 +1270,12 @@ async function getQueueProjects(force = false) {
   if (data && typeof data === "object") {
     for (const [key, val] of Object.entries(data)) {
       if (val === null || val === undefined) continue;
-
       let raw;
       if (typeof val === "string") raw = val;
       else if (typeof val === "object" && val.name) raw = String(val.name);
       else raw = key;
-
       const name = raw.trim().toLowerCase();
       if (!name) continue;
-
       if (!QUEUE_PROJECT_NAME_RE.test(name)) {
         if (!queueWarnedNames.has(name)) {
           queueWarnedNames.add(name);
@@ -1388,14 +1316,11 @@ async function fetchQueueProject(project) {
 
   for (const series of json) {
     if (!series || !Array.isArray(series.datapoints)) continue;
-
     const validPoints = series.datapoints.filter(dp => dp[0] !== null);
     const last = validPoints.pop();
     if (!last) continue;
-
     const value = String(last[0]);
     const timestamp = new Date(last[1] * 1000).toISOString();
-
     const isOldest = series.target.includes("Oldest Task");
     const metricName = series.target
       .replace(" - Total", "")
@@ -1403,13 +1328,9 @@ async function fetchQueueProject(project) {
 
     if (!projectData[metricName]) {
       projectData[metricName] = {
-        current: null,
-        duration: null,
-        durationRaw: null,
-        lastUpdated: timestamp
+        current: null, duration: null, durationRaw: null, lastUpdated: timestamp
       };
     }
-
     if (isOldest) {
       projectData[metricName].duration = formatDuration(value);
       projectData[metricName].durationRaw = value;
@@ -1432,9 +1353,8 @@ function mergeQueueProject(oldProject, newData) {
     const oldCur = om ? (om.current ?? null) : null;
     const newCur = nm.current ?? null;
 
-    if (!om) {
-      changed = true;
-    } else if (oldCur !== newCur) {
+    if (!om) changed = true;
+    else if (oldCur !== newCur) {
       if (oldCur !== null) previous = oldCur;
       changed = true;
     }
@@ -1449,7 +1369,6 @@ function mergeQueueProject(oldProject, newData) {
   }
 
   if (Object.keys(old).some(k => !(k in newData))) changed = true;
-
   return { merged, changed };
 }
 
@@ -1466,18 +1385,12 @@ async function runPool(items, limit, worker) {
 }
 
 const queueState = {
-  running: false,
-  lastRunAt: null,
-  lastDurationMs: null,
-  lastProjectCount: 0,
-  lastPushedCount: 0,
-  lastErrorCount: 0,
-  lastError: null
+  running: false, lastRunAt: null, lastDurationMs: null,
+  lastProjectCount: 0, lastPushedCount: 0, lastErrorCount: 0, lastError: null
 };
 
 async function runQueueCycle() {
   if (queueState.running) return { skipped: true, reason: "previous cycle still running" };
-
   queueState.running = true;
   const started = Date.now();
 
@@ -1511,9 +1424,7 @@ async function runQueueCycle() {
           QUEUE_HEARTBEAT_SEC > 0 &&
           Date.now() - (queueLastPush[project] || 0) >= QUEUE_HEARTBEAT_SEC * 1000;
 
-        if (changed || !oldProject || heartbeatDue) {
-          updates[project] = merged;
-        }
+        if (changed || !oldProject || heartbeatDue) updates[project] = merged;
       } catch (err) {
         errors++;
         lastErr = err.message;
@@ -1529,7 +1440,6 @@ async function runQueueCycle() {
     const updateKeys = Object.keys(updates);
     if (updateKeys.length > 0) {
       await axios.patch(QUEUE_FIREBASE_URL, updates, { timeout: 30000 });
-
       const now = Date.now();
       let removed = 0;
       for (const key of updateKeys) {
@@ -1601,28 +1511,20 @@ async function fetchStaffLookup() {
 async function fetchProjectTaskLookup() {
   try {
     const response = await axios.get(PROJECT_TASK_SHEET_URL(), {
-      responseType: 'text',
-      timeout: 30000
+      responseType: 'text', timeout: 30000
     });
-
     const lines = response.data.split(/\r?\n/).filter(l => l.trim().length > 0);
     if (lines.length < 2) return [];
-
     const splitLine = (line) =>
       line.split(',').map(cell => cell.trim().replace(/^"|"$/g, ''));
-
     const headers = splitLine(lines[0]).map(h => h.toLowerCase());
     const records = [];
-
     for (let i = 1; i < lines.length; i++) {
       const cells = splitLine(lines[i]);
       const record = {};
-      headers.forEach((header, idx) => {
-        record[header] = cells[idx] || '';
-      });
+      headers.forEach((header, idx) => { record[header] = cells[idx] || ''; });
       records.push(record);
     }
-
     return records;
   } catch (err) {
     throw new Error("Failed to fetch project/task sheet: " + err.message);
@@ -1646,18 +1548,11 @@ function readJsonBody(req) {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 1e6) {
-        req.destroy();
-        reject(new Error("Payload too large"));
-      }
+      if (body.length > 1e6) { req.destroy(); reject(new Error("Payload too large")); }
     });
     req.on("end", () => {
       if (!body) return resolve({});
-      try {
-        resolve(JSON.parse(body));
-      } catch (err) {
-        reject(new Error("Invalid JSON body"));
-      }
+      try { resolve(JSON.parse(body)); } catch (err) { reject(new Error("Invalid JSON body")); }
     });
     req.on("error", reject);
   });
@@ -1670,14 +1565,9 @@ function readJsonBody(req) {
 */
 const server = http.createServer(async (req, res) => {
   console.log(`${req.method} ${req.url}`);
-
   setCorsHeaders(res);
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname;
@@ -1695,60 +1585,26 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // Health check
     if (pathname === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
         service: "QAT Server - Unified",
         time: new Date().toISOString(),
-        cors: "enabled",
-        outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
-        queue_auto_interval_sec: QUEUE_INTERVAL_SEC,
-        cancellation_auto_interval_sec: CANCELLATION_AUTO_INTERVAL_SEC,
-        cancellation_firebase: CANCELLATION_FIREBASE_BASE,
         cancellation_table: CANCELLATION_TABLE,
         cancellation_columns: CANCELLATION_COL,
+        cancellation_auto_interval_sec: CANCELLATION_AUTO_INTERVAL_SEC,
       }));
       return;
     }
 
-    // DEBUG: list all columns of qat_cancelation_data
+    // DEBUG
     if (pathname === "/debug-cancellations" && req.method === "GET") {
       const dateStr = parseDateParam(query) || todayColombo();
       const q = buildQueryCancellations(dateStr);
       let bigqueryError = null;
       let rowCount = null;
       let sampleRows = [];
-      let columnsProbe = null;
-
-      // First probe: list columns
-      try {
-        const colSql = `
-          SELECT column_name, data_type
-          FROM \`trax-retail.backoffice.INFORMATION_SCHEMA.COLUMNS\`
-          WHERE table_name = 'qat_cancelation_data'
-          ORDER BY ordinal_position
-        `;
-        const r = await grafanaRequest('POST', QUERY_URL, {
-          query: `#standardSQL\n${colSql}`,
-          useLegacySql: false,
-        });
-        const jid = r.data.jobReference.jobId;
-        const loc = r.data.jobReference.location;
-        const rurl = `${QUERY_URL}/${jid}?location=${loc}`;
-        const result = await getQueryResults(rurl, 15);
-        const fields = (result.schema?.fields || []).map(f => f.name);
-        columnsProbe = (result.rows || []).map(row => {
-          const o = {};
-          row.f.forEach((c, i) => { o[fields[i]] = c.v; });
-          return o;
-        });
-      } catch (e) {
-        columnsProbe = { error: e.message };
-      }
-
-      // Second probe: try the actual cancellation query
       try {
         const response = await grafanaRequest('POST', QUERY_URL, q);
         const jobId = response.data.jobReference.jobId;
@@ -1764,23 +1620,16 @@ const server = http.createServer(async (req, res) => {
           data: e.response && e.response.data,
         };
       }
-
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        success: !bigqueryError,
-        date: dateStr,
-        table: CANCELLATION_TABLE,
-        columns: CANCELLATION_COL,
-        actualTableColumns: columnsProbe,
-        sql: q.query,
-        rowCount,
-        sampleRows,
-        bigqueryError,
+        success: !bigqueryError, date: dateStr,
+        table: CANCELLATION_TABLE, columns: CANCELLATION_COL,
+        sql: q.query, rowCount, sampleRows, bigqueryError,
       }, null, 2));
       return;
     }
 
-    // MODE 1: TEAM LEADER
+    // MODE 1
     if (pathname === "/fetch-all" && req.method === "GET" && (!query.mode || query.mode === "tl")) {
       const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
@@ -1800,7 +1649,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // MODE 2: STAFF ID
+    // MODE 2
     if (pathname === "/fetch-all" && req.method === "GET" && query.mode === "staff") {
       const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
@@ -1824,7 +1673,6 @@ const server = http.createServer(async (req, res) => {
     // Single fetch
     if (pathname === "/fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
-
       if (query.staff_id) {
         const staffId = String(query.staff_id).trim();
         const data = await fetchSingleStaff(staffId, dateStr);
@@ -1843,7 +1691,6 @@ const server = http.createServer(async (req, res) => {
         }));
         return;
       }
-
       const tlName = String(query.tl_name || TEAM_LEADERS[0]).trim();
       const data = await fetchSingleTL(tlName, dateStr);
       await saveToFirebase(FIREBASE_PATH_TL, {
@@ -1862,18 +1709,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // MODE 3: FILTERED
+    // MODE 3
     if (pathname === "/fetch-filtered" && req.method === "GET") {
       const project = (query.project || "").trim();
       const task = (query.task || "").trim();
       const dateStr = parseDateParam(query);
-
       if (!project || !task) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "project සහ task දෙකම required" }));
         return;
       }
-
       const rows = await fetchFilteredByProjectTask(project, task, dateStr);
       await saveToFirebase(FIREBASE_PATH_FILTERED, {
         updated_at: new Date().toISOString(),
@@ -1891,7 +1736,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // MODE 5: OUTFLOW
+    // MODE 5
     if (pathname === "/fetch-outflow" && req.method === "GET") {
       const resolved = resolveOutflowRange(query);
       if (resolved.error) {
@@ -1899,10 +1744,8 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: resolved.error }));
         return;
       }
-
       const { key, from, to, isToday } = resolved;
       let rows, updatedAt;
-
       if (isToday) {
         const payload = await refreshOutflow();
         rows = payload.data;
@@ -1911,7 +1754,6 @@ const server = http.createServer(async (req, res) => {
         rows = await fetchOutflow(from, to);
         updatedAt = new Date().toISOString();
       }
-
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true, mode: "outflow", range: key,
@@ -1950,14 +1792,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Read cancellations from Firebase
+    // Read cancellations
     if (pathname === "/cancellations" && req.method === "GET") {
       const requested = parseDateParam(query);
       const targetDate = requested || todayColombo();
-      const readUrl =
-        targetDate === todayColombo()
-          ? CANCELLATION_TODAY_URL
-          : CANCELLATION_ARCHIVE_URL(targetDate);
+      const readUrl = targetDate === todayColombo()
+        ? CANCELLATION_TODAY_URL
+        : CANCELLATION_ARCHIVE_URL(targetDate);
 
       try {
         const r = await axios.get(readUrl, { timeout: 30000 });
@@ -1977,7 +1818,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // MODE 6: QUEUE MONITOR
+    // MODE 6
     if (pathname === "/queue-monitor/status" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -2013,7 +1854,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Planning UI
+    // UIs
     if (pathname === "/planning-ui" && req.method === "GET") {
       fs.readFile(PLANNING_HTML_PATH, "utf8", (err, html) => {
         if (err) {
@@ -2027,7 +1868,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Cancellations UI
     if (pathname === "/cancellations-ui" && req.method === "GET") {
       fs.readFile(CANCELLATIONS_HTML_PATH, "utf8", (err, html) => {
         if (err) {
@@ -2041,7 +1881,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // MODE 4: PLANNING
+    // MODE 4
     if (pathname === "/planning" && req.method === "GET") {
       const planningMap = (await getFromFirebase(FIREBASE_PATH_PLANNING)) || {};
       const list = Object.entries(planningMap).map(([id, entry]) => ({ id, ...entry }));
@@ -2052,24 +1892,20 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/planning" && req.method === "POST") {
       let body;
-      try {
-        body = await readJsonBody(req);
-      } catch (err) {
+      try { body = await readJsonBody(req); }
+      catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
         return;
       }
-
       const project_name = String(body.project_name || "").trim();
       const task_name = String(body.task_name || "").trim();
       const target = Number(body.target);
-
       if (!project_name || !task_name || !Number.isFinite(target) || target < 0) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "project_name, task_name, target (>= 0) required" }));
         return;
       }
-
       const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
       const entry = {
         project_name, task_name, target,
@@ -2108,7 +1944,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Staff lookup
     if (pathname === "/staff-lookup" && req.method === "GET") {
       const csv = await fetchStaffLookup();
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -2116,7 +1951,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Project/Task lookup
     if (pathname === "/project-task-lookup" && req.method === "GET") {
       try {
         const data = await fetchProjectTaskLookup();
@@ -2129,7 +1963,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Denominator lookup
     if (pathname === "/denominator-lookup" && req.method === "GET") {
       try {
         const data = await getDenominatorData(true);
@@ -2149,7 +1982,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Default ID list
     if ((pathname === "/team-leaders" || pathname === "/staff-ids") && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -2160,41 +1992,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 404
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
   } catch (error) {
     console.error("❌ Server Error:", error.message);
     console.error("  Stack:", error.stack);
     res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: error.message,
-      details: error.stack
-    }));
+    res.end(JSON.stringify({ error: error.message, details: error.stack }));
   }
 });
 
-// Start server
+// Start
 server.listen(PORT, HOST, () => {
   console.log("================================");
-  console.log(`  🚀 QAT Server (Unified) running on http://${HOST}:${PORT}`);
+  console.log(`  🚀 QAT Server running on http://${HOST}:${PORT}`);
   console.log(`  🔐 Basic Auth user: ${AUTH_USER}`);
-  console.log(`  🌐 CORS: Enabled for all origins`);
-  console.log(`  🔥 Firebase paths:`);
-  console.log(`     TL mode         -> ${FIREBASE_PATH_TL}`);
-  console.log(`     Staff mode      -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`     Filtered        -> ${FIREBASE_PATH_FILTERED}`);
-  console.log(`     Planning        -> ${FIREBASE_PATH_PLANNING}`);
-  console.log(`     Outflow         -> ${FIREBASE_OUTFLOW_URL} (today only)`);
-  console.log(`     Queue           -> ${QUEUE_FIREBASE_URL}`);
-  console.log(`     Queue source    -> ${SERVER_PROJECTS_URL}`);
-  console.log(`     Cancellations   -> ${CANCELLATION_TODAY_URL}`);
-  console.log(`     Cancellations*  -> ${CANCELLATION_FIREBASE_BASE}/cancellations-by-date/<date>.json`);
   console.log(`  📊 Cancel table: ${CANCELLATION_TABLE}`);
   console.log(`  📊 Cancel cols:`);
-  Object.entries(CANCELLATION_COL).forEach(([k, v]) => {
-    console.log(`       ${k.padEnd(10)} -> ${v}`);
-  });
+  Object.entries(CANCELLATION_COL).forEach(([k, v]) => console.log(`       ${k.padEnd(10)} -> ${v}`));
   console.log("================================");
 
   startOutflowAutoLoop();
