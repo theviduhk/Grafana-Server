@@ -9,54 +9,32 @@ const path = require("path");
 | CONFIG
 |--------------------------------------------------------------------------
 | Meka thani server ekakin thanku data 7ma type eka handle karanawa:
-|   1. Team Leader (team_leader_staff_id) fetch  -> /TL Hourly.json
+|   1. Team Leader (TL Hourly)   -> /TL Hourly.json
+|        *** NEW: team_leader_staff_id eken nemei, staff sheet (roster) eken
+|        select karapu Shift Sup / Team Leader ta adala STAFF IDs walata data
+|        aran, Team Leader ID eka yatathe table ekak widihata Firebase ekata
+|        save karanawa. ***
 |   2. Staff ID (staff_id) fetch                 -> /QAT2 Output.json
 |   3. Project + Task filtered fetch             -> /qat_filtered.json
 |   4. Planning (project + task + target, multi) -> /planning.json
 |   5. Project Outflow (project | task | center) -> projectgap Firebase
-|                                                   Firebase /project-gap.json
 |   6. QUEUE MONITOR (Grafana queue total + oldest task, per project)
-|        -> https://thevindu-8fe8b-default-rtdb.firebaseio.com/queue_monitor
-|        Project list eka hardcode na. Firebase "Server Projects" node eken
-|        (qat-output DB) load wenawa, e nisa dashboard eken project add/remove
-|        kalama queue monitor ekatath auto apply wenawa.
 |   7. CANCELLATION (qat_cancelation_data table)
-|        -> https://cancellation-7294a-default-rtdb.firebaseio.com/
-|           qat_cancelation_data.json
-|        staff id ekak ho godak (prefix match) denna puluwan.
 |
-| Modes 1-4 support optional `date=YYYY-MM-DD`. Date eka denne nathnam
-| (allathwa waradi format eka dunnoth) default eka widihata "today" query
-| eka run wenawa.
+| TL HOURLY (MODE 1):
+|   GET /fetch-all                                   -> default TEAM_LEADERS (roster eken staff resolve)
+|   GET /fetch-all?shift_sup=Thevidu                 -> Shift Sup ge okkoma staff
+|   GET /fetch-all?shift_sup=All                     -> roster eke okkoma staff
+|   GET /fetch-all?shift_sup=Thevidu&team_leader=G123-OTL -> eka TL ge staff
+|   GET /fetch-all?team_leader=G123-OTL              -> eka TL ge staff
+|   (okkotama optional &date=YYYY-MM-DD)
 |
-| STAFF ID / TL ID matching is CASE-INSENSITIVE (g12345 / G12345 / k12345 ...
-| okkoma wada karanawa) - SQL eke UPPER(TRIM(...)) use karala.
-|
-| *** NEW: PREFIX MATCHING ***
-| ID eka full widihata denna oni na. Udahanayak:
-|     G12345        -> G12345, G12345-OTL, G12345-QAQC ... okkoma match wenawa
-|     G12345-OTL    -> G12345-OTL witharak match wenawa
-|     G12345-QAQC   -> G12345-QAQC witharak match wenawa
-| (match eka "<ID>" exact HO "<ID>-" walin patan gannawa.) Ekai G123 kiyala
-| dunnama G12345 match wenne na - "-" eka passe thiyenna oni.
-|
-| MODE 5 (/fetch-outflow) supports more:
-|   (none)                                   -> today   (also saved to Firebase)
-|   ?date=YYYY-MM-DD                         -> that single day
-|   ?range=today|yesterday|day_before|last_week
-|   ?from=YYYY-MM-DD&to=YYYY-MM-DD           -> custom range (max 92 days)
-| Only "today" is written to Firebase (project-gap.json). Past dates / ranges
-| are returned to the caller only, so they can never overwrite today's data.
-|
-| MODE 6 (queue monitor) background loop eken auto run wenawa. Manual:
-|   GET /queue-monitor/status    -> last run info
-|   GET /queue-monitor/refresh   -> ekhama cycle ekak run karanawa
-|
-| MODE 7 (cancellation):
-|   GET /fetch-cancellation                              -> okkoma data
-|   GET /fetch-cancellation?staff_ids=G123,G456-OTL      -> staff filter
-|   GET /fetch-cancellation?staff_ids=G123&date=YYYY-MM-DD
-|   GET /cancellation-columns                            -> table columns
+| Firebase shape (/TL Hourly.json):
+|   {
+|     updated_at, date, filter_config, total_leaders,
+|     team_leaders: { "<TL_ID>": { tl_name, staff_ids[], total_rows, rows[] } },
+|     data: [ { tl_name, rows, total_rows, fetched_at } ]   // backward compat
+|   }
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -64,44 +42,21 @@ const QUERY_URL =
 
 const FIREBASE_URL = "https://qat-output-default-rtdb.firebaseio.com";
 
-// Wenama Firebase path - features anuwa
-const FIREBASE_PATH_TL       = "/TL Hourly.json";     // Team Leader mode
-const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";   // Staff ID mode
-const FIREBASE_PATH_FILTERED = "/qat_filtered.json";  // Project/Task filtered mode
-const FIREBASE_PATH_PLANNING = "/planning.json";      // Planning mode
+const FIREBASE_PATH_TL       = "/TL Hourly.json";
+const FIREBASE_PATH_STAFF    = "/QAT2 Output.json";
+const FIREBASE_PATH_FILTERED = "/qat_filtered.json";
+const FIREBASE_PATH_PLANNING = "/planning.json";
 
-// MODE 5 (Outflow) - wenama Firebase database ekak, e nisa full URL eka.
 const FIREBASE_OUTFLOW_URL =
   "https://projectgap-4b7d9-default-rtdb.firebaseio.com/project-gaps.json";
 
-// Outflow data eka background eken auto-refresh wena gaman (seconds).
-// Kalin script eke wage 10s. 0 dunnoth auto-refresh nawathinawa (manual
-// /fetch-outflow call witharak). Render env eken OUTFLOW_INTERVAL_SEC
-// widihata change karanna puluwan.
 const OUTFLOW_AUTO_INTERVAL_SEC = Number(process.env.OUTFLOW_INTERVAL_SEC ?? 10);
-
-// Longest custom range /fetch-outflow will accept (days, inclusive).
 const OUTFLOW_MAX_RANGE_DAYS = Number(process.env.OUTFLOW_MAX_RANGE_DAYS ?? 92);
-
-// What "Previous Week" (range=last_week) means:
-//   "calendar" -> the last full Monday-Sunday week (default)
-//   "rolling"  -> the 7 days ending yesterday
 const PREVIOUS_WEEK_MODE = (process.env.PREVIOUS_WEEK_MODE || "calendar").toLowerCase();
 
 /*
 |--------------------------------------------------------------------------
 | MODE 6 CONFIG - QUEUE MONITOR
-|--------------------------------------------------------------------------
-| QUEUE_FIREBASE_URL        data push wenna thena (thevindu DB -> queue_monitor)
-| SERVER_PROJECTS_URL       project list eka ganna thena (qat-output DB ->
-|                           "Server Projects" node). Node eke nama wenas nam
-|                           SERVER_PROJECTS_PATH eka change karanna.
-| QUEUE_INTERVAL_SEC        cycle ekak iwara wela kiyada pasu next eka (0 = off)
-| QUEUE_CONCURRENCY         ekama welawata Grafana ekata yana request gana
-| QUEUE_HEARTBEAT_SEC       queue count wenas nowunath, duration (oldest task)
-|                           stale nowenna mekata parak project eka push karanawa
-|                           (0 = off)
-| QUEUE_PROJECTS_CACHE_SEC  Server Projects list eka cache karana kalaya
 |--------------------------------------------------------------------------
 */
 const QUEUE_FIREBASE_URL =
@@ -125,13 +80,6 @@ const QUEUE_PROJECTS_CACHE_SEC = Number(process.env.QUEUE_PROJECTS_CACHE_SEC ?? 
 |--------------------------------------------------------------------------
 | MODE 7 CONFIG - CANCELLATION
 |--------------------------------------------------------------------------
-| CANCELLATION_FIREBASE_URL  data save wenna thena (cancellation-7294a DB)
-| CANCEL_STAFF_COLUMN        table eke staff id column eka (default user)
-| CANCEL_DATE_COLUMN         table eke date/timestamp column eka
-|                            (default timestamp, DATE type)
-| Column names mokakda kiyala /cancellation-columns eken balala, wenas nam
-| Render env eke mema variables set karanna.
-|--------------------------------------------------------------------------
 */
 const CANCELLATION_FIREBASE_URL =
   process.env.CANCELLATION_FIREBASE_URL ||
@@ -140,13 +88,10 @@ const CANCELLATION_FIREBASE_URL =
 const CANCEL_TABLE = "trax-retail.backoffice.qat_cancelation_data";
 const CANCEL_STAFF_COLUMN = process.env.CANCEL_STAFF_COLUMN || "user";
 const CANCEL_DATE_COLUMN = process.env.CANCEL_DATE_COLUMN || "timestamp";
-// Column name eka safe da kiyala check (SQL injection walakwanna)
 const COLUMN_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-// planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
 
-// Render port config (Render PORT env eken automatic set wenawa)
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
 
@@ -158,7 +103,7 @@ const TEAM_LEADERS = [
   "G23179-OTL"
 ];
 
-// Staff lookup sheet
+// Staff lookup sheet (roster)
 const STAFF_SHEET_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vTcJSktGEdHycbjqLx-YD7-V1DUCH462h64XxaiuyKv9iK6n2FXgh6VAYvFEkS83DI76b2HJfppeuzd/pub?gid=1860286382&output=csv";
 
@@ -166,13 +111,13 @@ const STAFF_SHEET_URL =
 const PROJECT_TASK_SHEET_URL = () =>
   `https://docs.google.com/spreadsheets/d/e/2PACX-1vTcJSktGEdHycbjqLx-YD7-V1DUCH462h64XxaiuyKv9iK6n2FXgh6VAYvFEkS83DI76b2HJfppeuzd/pub?gid=822634964&output=csv&_=${Date.now()}`;
 
+// Roster eken staff IDs godak unoth BigQuery query ekata chunk walata kadanawa
+const STAFF_QUERY_CHUNK = Number(process.env.STAFF_QUERY_CHUNK ?? 400);
+const ROSTER_CACHE_MS = Number(process.env.ROSTER_CACHE_SEC ?? 300) * 1000;
+
 /*
 |--------------------------------------------------------------------------
 | CREDENTIALS
-|--------------------------------------------------------------------------
-| Env variables set karala thiyenawanam ewa use wenawa, nathnam kalin
-| thibba default values. Render dashboard eke Environment walata danna:
-|   AUTH_USER, AUTH_PASS, GRAFANA_USER, GRAFANA_PASS
 |--------------------------------------------------------------------------
 */
 const AUTH_USER = process.env.AUTH_USER || "admin";
@@ -219,7 +164,6 @@ function authenticate(req) {
 */
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-// Returns the same string if it is a real calendar date in YYYY-MM-DD form, else null.
 function parseYMD(raw) {
   const s = raw ? String(raw).trim() : "";
   if (!s || !DATE_RE.test(s)) return null;
@@ -246,21 +190,6 @@ function buildDateRangeClause(dateStr) {
 |--------------------------------------------------------------------------
 | SQL STRING HELPERS
 |--------------------------------------------------------------------------
-| sqlEscape      -> backslash + single quote escape (SQL injection safe)
-| normalizeIdSql -> Staff ID / TL ID eka trim + UPPERCASE karanawa, e nisa
-|                   user g12345 / G12345 / k12345 / K12345 mokak type kalath
-|                   match wenawa.
-| buildIdMatchSql-> PREFIX-AWARE matcher (NEW).
-|                   column = UPPER(TRIM(col))
-|                   match   = exact  HO  "<ID>-" walin patan gannawa
-|
-|   User type karapu "G12345"      -> G12345 / G12345-OTL / G12345-QAQC ...
-|   User type karapu "G12345-OTL"  -> G12345-OTL witharak
-|   User type karapu "G12345-QAQC" -> G12345-QAQC witharak
-|
-| STARTS_WITH use kala (LIKE nemei) - e nisa "_" "%" wage wildcard
-| characters walin awulak na.
-|--------------------------------------------------------------------------
 */
 function sqlEscape(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -276,12 +205,15 @@ function buildIdMatchSql(column, value) {
   return `(${col} = '${id}' OR STARTS_WITH(${col}, '${id}-'))`;
 }
 
+// NEW: staff IDs list ekak exact (case-insensitive) match karanawa
+function buildIdListMatchSql(column, ids) {
+  const list = ids.map(id => `'${normalizeIdSql(id)}'`).join(", ");
+  return `UPPER(TRIM(${column})) IN UNNEST([${list}])`;
+}
+
 /*
 |--------------------------------------------------------------------------
 | OUTFLOW DATE RANGE RESOLVER
-|--------------------------------------------------------------------------
-| All calendar maths is done in UTC, the same day boundary BigQuery's
-| CURRENT_DATE() uses for "today", so presets and today stay consistent.
 |--------------------------------------------------------------------------
 */
 function todayUTC() {
@@ -305,7 +237,6 @@ function daysBetweenInclusive(fromStr, toStr) {
   return Math.round((b - a) / 86400000) + 1;
 }
 
-// -> { key, from, to, isToday }  or  { error }
 function resolveOutflowRange(query) {
   const today = todayUTC();
   const todayStr = ymdUTC(today);
@@ -316,7 +247,6 @@ function resolveOutflowRange(query) {
   let key, from, to;
 
   if (fromRaw || toRaw) {
-    // Custom range: both ends required and valid
     const f = parseYMD(fromRaw);
     const t = parseYMD(toRaw);
     if (!f || !t) return { error: "from and to must both be valid YYYY-MM-DD dates" };
@@ -336,7 +266,7 @@ function resolveOutflowRange(query) {
         from = ymdUTC(addDaysUTC(today, -7));
         to = ymdUTC(addDaysUTC(today, -1));
       } else {
-        const sinceMonday = (today.getUTCDay() + 6) % 7; // Mon=0 ... Sun=6
+        const sinceMonday = (today.getUTCDay() + 6) % 7;
         const thisMonday = addDaysUTC(today, -sinceMonday);
         from = ymdUTC(addDaysUTC(thisMonday, -7));
         to = ymdUTC(addDaysUTC(thisMonday, -1));
@@ -345,7 +275,6 @@ function resolveOutflowRange(query) {
       return { error: "range must be one of: today, yesterday, day_before, last_week" };
     }
   } else if (query.date) {
-    // Backwards compatible single-day param
     const d = parseDateParam(query);
     if (!d) return { error: "date must be a valid YYYY-MM-DD date" };
     key = "date";
@@ -356,7 +285,7 @@ function resolveOutflowRange(query) {
   }
 
   if (from > todayStr) return { error: "The selected dates are in the future" };
-  if (to > todayStr) to = todayStr; // ranges can't run past today
+  if (to > todayStr) to = todayStr;
 
   const span = daysBetweenInclusive(from, to);
   if (span > OUTFLOW_MAX_RANGE_DAYS) {
@@ -456,8 +385,6 @@ async function grafanaRequest(method, reqUrl, data = null, retryCount = 0) {
 |--------------------------------------------------------------------------
 | BIGQUERY — poll until job complete
 |--------------------------------------------------------------------------
-| maxTries * 2s = max wait. Default 10 (20s). Range queries pass a bigger number.
-|--------------------------------------------------------------------------
 */
 async function getQueryResults(resultUrl, maxTries = 10) {
   for (let i = 0; i < maxTries; i++) {
@@ -470,13 +397,12 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 
 /*
 |--------------------------------------------------------------------------
-| BUILD SQL — variants (team leader / staff id / project+task / outflow)
+| BUILD SQL — variants
 |--------------------------------------------------------------------------
 */
+
+// LEGACY: team_leader_staff_id column eken (roster ekata TL nathnam fallback widihata witharak)
 function buildQueryByTeamLeader(tlName, dateStr) {
-  // Case-insensitive + trimmed + PREFIX match:
-  //   "g26658"      -> G26658, G26658-OTL, G26658-QAQC ...
-  //   "g26658-otl"  -> G26658-OTL only
   const idMatch = buildIdMatchSql("team_leader_staff_id", tlName);
   const dateClause = buildDateRangeClause(dateStr);
   return {
@@ -507,10 +433,39 @@ function buildQueryByTeamLeader(tlName, dateStr) {
   };
 }
 
+// NEW: staff IDs list ekakata adala data (TL Hourly eka dan meken)
+function buildQueryByStaffIdList(staffIds, dateStr) {
+  const idMatch = buildIdListMatchSql("staff_id", staffIds);
+  const dateClause = buildDateRangeClause(dateStr);
+  return {
+    query: `
+      #standardSQL
+      SELECT
+        TIMESTAMP_TRUNC(event_timestamp, HOUR) AS timestamp,
+        project_name,
+        task_name,
+        staff_id,
+        template_name,
+        SUM(
+          CASE
+            WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
+            ELSE count
+          END
+        ) AS value
+      FROM \`trax-retail.backoffice.tl_hourly_report\`
+      WHERE
+        ${dateClause}
+        AND task_name    IS NOT NULL
+        AND project_name IS NOT NULL
+        AND ${idMatch}
+      GROUP BY 1, 2, 3, 4, 5
+      ORDER BY timestamp
+    `,
+    useLegacySql: false,
+  };
+}
+
 function buildQueryByStaffId(staffId, dateStr) {
-  // Case-insensitive + trimmed + PREFIX match:
-  //   "g12345"       -> G12345, G12345-OTL, G12345-QAQC ...
-  //   "g12345-qaqc"  -> G12345-QAQC only
   const idMatch = buildIdMatchSql("staff_id", staffId);
   const dateClause = buildDateRangeClause(dateStr);
   return {
@@ -568,14 +523,6 @@ function buildQueryByProjectTask(project, task, dateStr) {
   };
 }
 
-// MODE 5: Project outflow (kalin standalone script eke query eka).
-// Kalin "CONCAT(project_name,' | ',task_name,' | ',center)" karala pasuwa
-// split karanawa wenuwata, dan columns 3ma wenama select karanawa - e nisa
-// project name ekaka " | " thibunath data waradi wenne na.
-//
-// fromStr / toStr = 'YYYY-MM-DD' (already validated by resolveOutflowRange, so safe to inline).
-// Both null -> today via CURRENT_DATE(). Output shape is identical for a day or a range:
-// values are summed per project / task / center over the whole range.
 function buildQueryOutflow(fromStr, toStr) {
   let dateClause;
   if (fromStr && toStr) {
@@ -602,9 +549,6 @@ function buildQueryOutflow(fromStr, toStr) {
   };
 }
 
-// MODE 7: Cancellation data (qat_cancelation_data)
-// staffIds denna nam (ekak ho godak) prefix-aware match (G123 -> G123-OTL ...).
-// staffIds nathnam / dateStr nathnam e filter eka apply wenne na.
 function buildQueryCancellation(staffIds, dateStr) {
   if (!COLUMN_NAME_RE.test(CANCEL_STAFF_COLUMN) || !COLUMN_NAME_RE.test(CANCEL_DATE_COLUMN)) {
     throw new Error("Invalid CANCEL_STAFF_COLUMN / CANCEL_DATE_COLUMN");
@@ -680,7 +624,6 @@ function processResults(result) {
     });
 }
 
-// MODE 5 rows: { project, task, center, value }  (kalin script eke output shape eka)
 function processOutflowResults(result) {
   if (!result.rows) return [];
   const fields = result.schema.fields.map(f => f.name);
@@ -696,7 +639,6 @@ function processOutflowResults(result) {
   });
 }
 
-// MODE 7 / generic: schema eke okkoma columns rows widihata (SELECT *)
 function processGenericResults(result) {
   if (!result.rows) return [];
   const fields = result.schema.fields.map(f => f.name);
@@ -727,13 +669,11 @@ async function getFromFirebase(firebasePath) {
   }
 }
 
-// MODE 5 - wenama Firebase database ekata (project-gap.json) save karanawa
 async function saveOutflowToFirebase(payload) {
   await axios.put(FIREBASE_OUTFLOW_URL, payload, { timeout: 30000 });
   console.log("  🔥 Outflow Firebase updated (project-gap.json)");
 }
 
-// MODE 7 - cancellation Firebase database ekata save karanawa
 async function saveCancellationToFirebase(payload) {
   await axios.put(CANCELLATION_FIREBASE_URL, payload, { timeout: 60000 });
   console.log("  🔥 Cancellation Firebase updated (qat_cancelation_data.json)");
@@ -742,15 +682,6 @@ async function saveCancellationToFirebase(payload) {
 /*
 |--------------------------------------------------------------------------
 | DENOMINATOR LOOKUP (normalized keys - lowercase + trimmed)
-|--------------------------------------------------------------------------
-| The published "Denominator Sheet" CSV (gid 822634964) actually contains
-| TWO independent tables side by side:
-|
-|   Table 1 "Denominator Sheet"  -> columns A:Y  (Project + task-name grid)
-|   Table 2 "UF Denominator"     -> columns AA:AD (Project, Task, Sub Task, Denominator)
-|
-| They are NOT row-aligned. Row 1 of the CSV is a merged title row - the
-| REAL column headers are on row 2, and data starts on row 3.
 |--------------------------------------------------------------------------
 */
 const normKey = (s) => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
@@ -782,7 +713,6 @@ function ufKey(project, task, subtask) {
 
 const NON_TASK_HEADERS = new Set(['vlookup', 'region']);
 
-// Fixed column offsets of the UF Denominator table (columns AA:AD).
 const UF_COL_PROJECT = 26;
 const UF_COL_TASK = 27;
 const UF_COL_SUBTASK = 28;
@@ -791,7 +721,7 @@ const UF_COL_DENOMINATOR = 29;
 let denominatorCache = {
   data: null,
   timestamp: null,
-  cacheDuration: 5 * 60 * 1000 // 5 minutes
+  cacheDuration: 5 * 60 * 1000
 };
 
 async function fetchDenominatorSheet() {
@@ -822,7 +752,6 @@ async function fetchDenominatorSheet() {
     for (let i = 2; i < lines.length; i++) {
       const cells = splitLine(lines[i]);
 
-      // ---- Table 1: "Denominator Sheet" (project x task grid) ----
       const project = normKey(cells[0] || '');
       if (project) {
         for (let j = 1; j <= taskNames.length; j++) {
@@ -838,7 +767,6 @@ async function fetchDenominatorSheet() {
         }
       }
 
-      // ---- Table 2: "UF Denominator" (independent long-format table) ----
       const ufProject = (cells[UF_COL_PROJECT] || '').trim();
       const ufTask = (cells[UF_COL_TASK] || '').trim();
       const ufSubtask = (cells[UF_COL_SUBTASK] || '').trim();
@@ -880,7 +808,7 @@ async function getDenominatorData(forceRefresh = false) {
 
 /*
 |--------------------------------------------------------------------------
-| TASK FALLBACK GROUPS (sheet eke cell eka empty/"-" unoth)
+| TASK FALLBACK GROUPS
 |--------------------------------------------------------------------------
 */
 const TASK_FALLBACK_035 = new Set([
@@ -903,10 +831,6 @@ function taskFallback(normTask) {
   return 0;
 }
 
-// 1. exact task, subtask = Menu
-// 2. exact task, any other subtask
-// 3. equivalent task, subtask = Menu
-// 4. equivalent task, any other subtask
 function findUFDenominator(project, task, ufRowsByProject) {
   const rows = ufRowsByProject[normKey(project)];
   if (!rows || !rows.length) return undefined;
@@ -968,7 +892,6 @@ function lookupDenominator(project, task, denominatorData, templateName) {
   const normTask    = normKey(task);
   const ufRowsByProject = denominatorData.ufRowsByProject || {};
 
-  // PGES: "Repair Only" when template_name contains "display", else "Repair & Attribute".
   if (normProject === 'pges') {
     const subtask = normKey(templateName).includes('display') ? 'Repair Only' : 'Repair & Attribute';
     const ufValue = findUFDenominatorBySubtask(normProject, normTask, subtask, ufRowsByProject);
@@ -991,7 +914,6 @@ function lookupDenominator(project, task, denominatorData, templateName) {
     if (ufValue !== undefined) return ufValue;
   }
 
-  // Fallback: main "Denominator Sheet" matrix, then the hardcoded fallback.
   const exactKey = `${normProject}||${normTask}`;
   if (denominatorData.byProjectTask[exactKey] !== undefined) {
     return denominatorData.byProjectTask[exactKey];
@@ -1010,11 +932,195 @@ async function enrichWithDenominator(rows) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 1: Team Leader (team_leader_staff_id)
+| STAFF ROSTER (staff sheet -> Shift Sup / Team Leader -> Staff IDs)
+|--------------------------------------------------------------------------
+| Frontend eke parseStaffCsv ekama logic eka. Header names:
+|   id      : "qat id" | "gid" | "...qat id..." | "staff ... id"
+|   name    : "name"
+|   shift   : "shift sup"
+|   TL      : "teamlead" | "team lead" | "team_lead" | "tl"
+| 5 min cache.
 |--------------------------------------------------------------------------
 */
-async function fetchSingleTL(tlName, dateStr) {
-  console.log(`  [TL] Fetching: tl_name="${tlName}" date="${dateStr || 'today'}"`);
+function parseCsvRows(csv) {
+  const rows = [];
+  const text = String(csv || "").replace(/^\uFEFF/, "");
+  let row = [];
+  let cell = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { cell += '"'; i++; } else inQuotes = false;
+      } else cell += ch;
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(cell.trim()); cell = "";
+    } else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell.trim()); cell = "";
+      if (row.some(c => c !== "")) rows.push(row);
+      row = [];
+    } else cell += ch;
+  }
+  row.push(cell.trim());
+  if (row.some(c => c !== "")) rows.push(row);
+  return rows;
+}
+
+const idKeyOf = (s) => String(s ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim().toUpperCase();
+const lowerTrim = (s) => String(s ?? "").toLowerCase().trim();
+
+function parseRosterCsv(csv) {
+  const lines = parseCsvRows(csv);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].map(h => h.toLowerCase().trim());
+  const idIdx = headers.findIndex(h =>
+    h === "qat id" || h === "gid" || h.includes("qat id") || (h.includes("staff") && h.includes("id")));
+  const nameIdx = headers.findIndex(h => h === "name");
+  const shiftIdx = (() => {
+    const e = headers.findIndex(h => h === "shift sup");
+    return e !== -1 ? e : headers.findIndex(h => h.includes("shift sup"));
+  })();
+  const tlIdx = headers.findIndex(h => h === "teamlead" || h === "team lead" || h === "team_lead" || h === "tl");
+
+  if (idIdx < 0) return [];
+
+  const entries = [];
+  const seen = new Set();
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i];
+    const id = String(cells[idIdx] ?? "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+    if (!id) continue;
+    const key = idKeyOf(id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({
+      id,
+      key,
+      name: nameIdx >= 0 ? (cells[nameIdx] || "").trim() : "",
+      shiftSup: shiftIdx >= 0 ? (cells[shiftIdx] || "").trim() : "",
+      tl: tlIdx >= 0 ? (cells[tlIdx] || "").trim() : "",
+    });
+  }
+  return entries;
+}
+
+let rosterCache = { data: null, ts: 0 };
+
+async function getStaffRoster(force = false) {
+  const now = Date.now();
+  if (!force && rosterCache.data && now - rosterCache.ts < ROSTER_CACHE_MS) {
+    return rosterCache.data;
+  }
+  const csv = await fetchStaffLookup();
+  const data = parseRosterCsv(csv);
+  rosterCache = { data, ts: now };
+  console.log(`  📋 Roster loaded: ${data.length} staff`);
+  return data;
+}
+
+// shiftSup: "" / "All" = filter nathuwa.  teamLeader: "" = filter nathuwa.
+// -> Map<tlId, staffId[]>
+function buildScopeFromRoster(roster, { shiftSup, teamLeader }) {
+  const ss = lowerTrim(shiftSup);
+  const tlWanted = lowerTrim(teamLeader);
+  const useShift = ss && ss !== "all";
+
+  const scope = new Map();
+  for (const e of roster) {
+    if (useShift && lowerTrim(e.shiftSup) !== ss) continue;
+    if (tlWanted && lowerTrim(e.tl) !== tlWanted) continue;
+    const tl = e.tl || "UNASSIGNED";
+    if (!scope.has(tl)) scope.set(tl, []);
+    scope.get(tl).push(e.id);
+  }
+  return scope;
+}
+
+// TL list ekakata (default TEAM_LEADERS wage) -> Map<tlId, staffId[]>  (roster eke thiyena ewa witharak)
+function buildScopeForTLs(roster, tlList) {
+  const wanted = new Map(tlList.map(t => [lowerTrim(t), t]));
+  const scope = new Map();
+  for (const e of roster) {
+    const hit = wanted.get(lowerTrim(e.tl));
+    if (!hit) continue;
+    if (!scope.has(hit)) scope.set(hit, []);
+    scope.get(hit).push(e.id);
+  }
+  return scope;
+}
+
+/*
+|--------------------------------------------------------------------------
+| FETCH — MODE 1: TL HOURLY (staff-ID based)
+|--------------------------------------------------------------------------
+*/
+async function runStaffListQuery(staffIds, dateStr) {
+  const query = buildQueryByStaffIdList(staffIds, dateStr);
+  const response = await grafanaRequest('POST', QUERY_URL, query);
+  const { jobId, location } = response.data.jobReference;
+  const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
+
+  let result = await getQueryResults(resultUrl, 30);
+  let rows = processResults(result);
+
+  let pageToken = result.pageToken;
+  let pages = 1;
+  while (pageToken && pages < 100) {
+    const pageRes = await grafanaRequest('GET', `${resultUrl}&pageToken=${encodeURIComponent(pageToken)}`);
+    result = pageRes.data;
+    rows = rows.concat(processResults(result));
+    pageToken = result.pageToken;
+    pages++;
+  }
+  return rows;
+}
+
+// scopeMap: Map<tlId, staffId[]>  ->  TLData[]  ({ tl_name, rows, total_rows, staff_ids, fetched_at })
+async function fetchByScopeMap(scopeMap, dateStr) {
+  const staffToTL = new Map();
+  const allIds = [];
+  for (const [tl, ids] of scopeMap) {
+    for (const id of ids) {
+      const k = idKeyOf(id);
+      if (staffToTL.has(k)) continue;
+      staffToTL.set(k, tl);
+      allIds.push(id);
+    }
+  }
+
+  const rowsByTL = new Map(Array.from(scopeMap.keys()).map(tl => [tl, []]));
+
+  if (allIds.length > 0) {
+    const chunks = [];
+    for (let i = 0; i < allIds.length; i += STAFF_QUERY_CHUNK) chunks.push(allIds.slice(i, i + STAFF_QUERY_CHUNK));
+    console.log(`  [TL] Querying ${allIds.length} staff ID(s) in ${chunks.length} chunk(s)`);
+
+    const chunkRows = await Promise.all(chunks.map(c => runStaffListQuery(c, dateStr)));
+    let rows = [].concat(...chunkRows);
+    rows = await enrichWithDenominator(rows);
+
+    for (const r of rows) {
+      const tl = staffToTL.get(idKeyOf(r.staff_id));
+      if (!tl) continue;
+      rowsByTL.get(tl).push(r);
+    }
+  }
+
+  const now = new Date().toISOString();
+  return Array.from(scopeMap.entries()).map(([tl, ids]) => {
+    const rows = rowsByTL.get(tl) || [];
+    return { tl_name: tl, staff_ids: ids, rows, total_rows: rows.length, fetched_at: now };
+  });
+}
+
+// LEGACY single TL (team_leader_staff_id) - roster eke TL nathnam fallback
+async function fetchSingleTLLegacy(tlName, dateStr) {
+  console.log(`  [TL-legacy] Fetching: tl_name="${tlName}" date="${dateStr || 'today'}"`);
   const query = buildQueryByTeamLeader(tlName, dateStr);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
@@ -1027,20 +1133,113 @@ async function fetchSingleTL(tlName, dateStr) {
   return { tl_name: tlName, rows, total_rows: rows.length, fetched_at: new Date().toISOString() };
 }
 
+async function safeRoster() {
+  try {
+    return await getStaffRoster();
+  } catch (err) {
+    console.error("  ⚠️ Roster load failed:", err.message);
+    return null;
+  }
+}
+
+// Single TL: roster staff thiyenawanam staff IDs walin, nathnam legacy
+async function fetchSingleTL(tlName, dateStr) {
+  console.log(`  [TL] Fetching: tl_name="${tlName}" date="${dateStr || 'today'}"`);
+  const roster = await safeRoster();
+  if (roster) {
+    const scope = buildScopeForTLs(roster, [tlName]);
+    if (scope.size > 0) {
+      const [entry] = await fetchByScopeMap(scope, dateStr);
+      // tl_name eka user type karapu widihatama thiyenna
+      return { ...entry, tl_name: tlName };
+    }
+  }
+  return fetchSingleTLLegacy(tlName, dateStr);
+}
+
+// Default TL list: roster eken resolve wena ewa ekama query ekakin, nathi ewa legacy
 async function fetchAllTeamLeaders(list, dateStr) {
   const tlList = (list && list.length) ? list : TEAM_LEADERS;
-  console.log(`\n>>> [TL] Fetching data for ${tlList.length} Team Leaders... date="${dateStr || 'today'}"`);
-  const results = await Promise.all(
-    tlList.map(async (tlName) => {
-      try {
-        return await fetchSingleTL(tlName, dateStr);
-      } catch (err) {
-        console.error(`  Error fetching ${tlName}:`, err.message);
-        return { tl_name: tlName, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() };
+  console.log(`\n>>> [TL] Fetching ${tlList.length} Team Leader(s) via roster... date="${dateStr || 'today'}"`);
+
+  const roster = await safeRoster();
+  const resolved = roster ? buildScopeForTLs(roster, tlList) : new Map();
+  const resolvedKeys = new Set(Array.from(resolved.keys()).map(lowerTrim));
+  const missing = tlList.filter(t => !resolvedKeys.has(lowerTrim(t)));
+
+  const results = [];
+
+  if (resolved.size > 0) {
+    try {
+      results.push(...await fetchByScopeMap(resolved, dateStr));
+    } catch (err) {
+      console.error("  Error fetching roster-based TL data:", err.message);
+      for (const tl of resolved.keys()) {
+        results.push({ tl_name: tl, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() });
       }
-    })
-  );
+    }
+  }
+
+  if (missing.length > 0) {
+    console.log(`  [TL] ${missing.length} TL(s) not in roster -> legacy team_leader_staff_id query`);
+    const legacy = await Promise.all(missing.map(async (tl) => {
+      try {
+        return await fetchSingleTLLegacy(tl, dateStr);
+      } catch (err) {
+        console.error(`  Error fetching ${tl}:`, err.message);
+        return { tl_name: tl, error: err.message, rows: [], total_rows: 0, fetched_at: new Date().toISOString() };
+      }
+    }));
+    results.push(...legacy);
+  }
+
   return results;
+}
+
+// Shift Sup / Team Leader scope eka (dashboard filters)
+async function fetchTeamLeadersByScope({ shiftSup, teamLeader }, dateStr) {
+  console.log(`\n>>> [TL] Scope fetch: shift_sup="${shiftSup || '-'}" team_leader="${teamLeader || '-'}" date="${dateStr || 'today'}"`);
+  const roster = await getStaffRoster();
+  const scope = buildScopeFromRoster(roster, { shiftSup, teamLeader });
+  const staffCount = Array.from(scope.values()).reduce((n, a) => n + a.length, 0);
+  console.log(`  Scope resolved: ${scope.size} team leader(s), ${staffCount} staff`);
+  if (scope.size === 0) return [];
+  return fetchByScopeMap(scope, dateStr);
+}
+
+// Firebase key safe karanawa (. $ # [ ] / wage characters)
+function fbKey(s) {
+  return String(s || "UNASSIGNED").trim().replace(/[.$#\[\]\/]/g, "_") || "UNASSIGNED";
+}
+
+// TL Hourly -> Firebase.  Team Leader ID eka yatathe table (staff_ids + rows)
+async function saveTLHourly(allData, meta) {
+  const team_leaders = {};
+  for (const d of allData) {
+    team_leaders[fbKey(d.tl_name)] = {
+      tl_name: d.tl_name,
+      staff_ids: d.staff_ids || [],
+      total_rows: d.total_rows || 0,
+      fetched_at: d.fetched_at,
+      ...(d.error ? { error: d.error } : {}),
+      rows: d.rows || [],
+    };
+  }
+  await saveToFirebase(FIREBASE_PATH_TL, {
+    updated_at: new Date().toISOString(),
+    date: meta.date || "today",
+    filter_config: meta.filter_config || {},
+    total_leaders: allData.length,
+    team_leaders,
+    // backward compatible array (tl_name + rows)
+    data: allData.map(d => ({
+      tl_name: d.tl_name,
+      rows: d.rows || [],
+      total_rows: d.total_rows || 0,
+      fetched_at: d.fetched_at,
+      ...(d.error ? { error: d.error } : {}),
+    })),
+  });
 }
 
 /*
@@ -1098,7 +1297,7 @@ async function fetchFilteredByProjectTask(project, task, dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 4: Planning (multiple project+task+target combos)
+| FETCH — MODE 4: Planning
 |--------------------------------------------------------------------------
 */
 async function fetchPlanningActual(entry, dateStr) {
@@ -1151,18 +1350,7 @@ async function refreshAllPlanning(dateStr) {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 5: Project Outflow (project | task | center)
-|--------------------------------------------------------------------------
-| 560_project_outflow table eken project/task/center wise SUM(count) aran
-| denawa. fromStr/toStr null nam "today" (CURRENT_DATE()); nathnam e day
-| eka / range eka.
-|
-| Saved to Firebase (/project-gap.json) ONLY for today - see refreshOutflow().
-| Saved shape (kalin ekama):
-|   { lastUpdated, date, total_rows, data: [{ project, task, center, value }] }
-|
-| BigQuery result eka pages walata kadala enna puluwan, e nisa pageToken
-| thiyenakan ma ella pages ekathu karagannawa.
+| FETCH — MODE 5: Project Outflow
 |--------------------------------------------------------------------------
 */
 async function fetchOutflow(fromStr, toStr) {
@@ -1174,12 +1362,10 @@ async function fetchOutflow(fromStr, toStr) {
   const location = response.data.jobReference.location;
   const resultUrl = `${QUERY_URL}/${jobId}?location=${location}`;
 
-  // Multi-day ranges scan more data, so allow the job longer to finish (30 x 2s = 60s)
   const isMultiDay = !!(fromStr && toStr && fromStr !== toStr);
   let result = await getQueryResults(resultUrl, isMultiDay ? 30 : 10);
   let rows = processOutflowResults(result);
 
-  // Extra pages (large result sets)
   let pageToken = result.pageToken;
   let pages = 1;
   while (pageToken && pages < 50) {
@@ -1197,11 +1383,8 @@ async function fetchOutflow(fromStr, toStr) {
   return rows;
 }
 
-// Overlap guard - aluth refresh ekak start wenna kalin kalin ekak iwara wela nathnam skip karanawa
 let outflowRunning = false;
 
-// TODAY only: fetch + write to Firebase (project-gap.json). Used by the auto loop and by
-// /fetch-outflow when the resolved range is today.
 async function refreshOutflow() {
   const rows = await fetchOutflow(null, null);
   const payload = {
@@ -1221,7 +1404,7 @@ async function autoRefreshOutflowOnce() {
   }
   outflowRunning = true;
   try {
-    await refreshOutflow(); // auto-refresh eka hemadama "today"
+    await refreshOutflow();
     console.log("✅ [OUTFLOW] Updated:", new Date().toLocaleTimeString());
   } catch (err) {
     console.error("❌ [OUTFLOW] Auto refresh error:", err.message);
@@ -1244,10 +1427,7 @@ function startOutflowAutoLoop() {
 
 /*
 |--------------------------------------------------------------------------
-| FETCH — MODE 7: Cancellation (qat_cancelation_data)
-|--------------------------------------------------------------------------
-| runBigQuery: query eka run karala, pages okkoma ekathu karala rows
-| (SELECT * - schema eke okkoma columns) return karanawa.
+| FETCH — MODE 7: Cancellation
 |--------------------------------------------------------------------------
 */
 async function runBigQuery(query, maxTries = 30) {
@@ -1289,22 +1469,6 @@ async function fetchCancellation(staffIds, dateStr) {
 |--------------------------------------------------------------------------
 | MODE 6: QUEUE MONITOR
 |--------------------------------------------------------------------------
-| Flow:
-|   1. "Server Projects" (qat-output Firebase) eken project list eka load
-|      karanawa  -> hardcode list eka nemei.
-|   2. Project hamadamata Grafana (datasource 29 /render) eken queue total +
-|      oldest task aran, metric 13 ekatama.
-|   3. Firebase eke thiyena eka samaga compare karala, wenas wela thiyena
-|      project witharak queue_monitor ekata PATCH karanawa. Count eka
-|      wenas wunama kalin value eka `previous` widihata save wenawa.
-|   4. Server Projects eken ain karapu project queue_monitor eken auto ain
-|      wenawa.
-|
-| Saved shape (project ekakata):
-|   queue_monitor/<project>/<metric name> = {
-|     current, duration, durationRaw, previous, lastUpdated
-|   }
-|--------------------------------------------------------------------------
 */
 const QUEUE_METRICS = [
   { path: "validation", name: "validation" },
@@ -1322,11 +1486,8 @@ const QUEUE_METRICS = [
   { path: "offline_voting", name: "offline voting" }
 ];
 
-// Graphite path ekata dana nisa project name eka safe wenna oni
-// (dot eka path separator, quote eka alias eka kadanawa).
 const QUEUE_PROJECT_NAME_RE = /^[a-z0-9_-]+$/;
 
-// seconds -> human readable
 function formatDuration(seconds) {
   seconds = Math.floor(Number(seconds));
   if (isNaN(seconds)) return null;
@@ -1350,8 +1511,6 @@ function formatDuration(seconds) {
   return `${weeks}w ${remainingDays}d`;
 }
 
-// Grafana /render call (form-urlencoded). Shared session manager eka use karanawa.
-// Session expire unoth (401/403 ho JSON nemei response ekak) re-login karala retry.
 async function grafanaRender(body, retryCount = 0) {
   let usedSession = null;
   try {
@@ -1372,7 +1531,6 @@ async function grafanaRender(body, retryCount = 0) {
     const expired = status === 401 || status === 403 || error.badSession;
     if (expired && retryCount < 2) {
       console.warn("⚠️ [QUEUE] Session expired or invalid. Refreshing Grafana session...");
-      // Wena request ekak kalinma session eka refresh karala nam eka aye reset nokarana
       if (grafanaSession === usedSession) grafanaSession = null;
       return grafanaRender(body, retryCount + 1);
     }
@@ -1380,7 +1538,6 @@ async function grafanaRender(body, retryCount = 0) {
   }
 }
 
-// ---- Project list (Firebase "Server Projects") ----
 let queueProjectsCache = { list: [], ts: 0 };
 const queueWarnedNames = new Set();
 
@@ -1426,9 +1583,8 @@ async function getQueueProjects(force = false) {
   return list;
 }
 
-// ---- Firebase mirror (queue_monitor node eke current state eka) ----
-let queueMirror = null;          // null = aye load karanna oni
-const queueLastPush = {};        // project -> last push time (ms)
+let queueMirror = null;
+const queueLastPush = {};
 
 async function loadQueueMirror() {
   const res = await axios.get(QUEUE_FIREBASE_URL, { timeout: 30000 });
@@ -1436,7 +1592,6 @@ async function loadQueueMirror() {
   console.log(`  📥 [QUEUE] Loaded ${Object.keys(queueMirror).length} existing project(s) from Firebase`);
 }
 
-// ---- Fetch one project's queue numbers from Grafana ----
 async function fetchQueueProject(project) {
   const params = new URLSearchParams();
   for (const m of QUEUE_METRICS) {
@@ -1485,8 +1640,6 @@ async function fetchQueueProject(project) {
   return projectData;
 }
 
-// Old + new data merge karala, wenas wela thiyenawada kiyala balanawa.
-// "changed" = metric aluth / ain una / queue count eka wenas una.
 function mergeQueueProject(oldProject, newData) {
   const old = oldProject || {};
   const merged = {};
@@ -1519,7 +1672,6 @@ function mergeQueueProject(oldProject, newData) {
   return { merged, changed };
 }
 
-// Simple concurrency pool
 async function runPool(items, limit, worker) {
   let next = 0;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -1542,7 +1694,6 @@ const queueState = {
   lastError: null
 };
 
-// Cycle ekak: projects load -> Grafana fetch -> diff -> Firebase PATCH
 async function runQueueCycle() {
   if (queueState.running) return { skipped: true, reason: "previous cycle still running" };
 
@@ -1573,9 +1724,8 @@ async function runQueueCycle() {
         const newData = await fetchQueueProject(project);
         const oldProject = queueMirror[project];
 
-        // Grafana eke me project ekata data ekak na
         if (Object.keys(newData).length === 0) {
-          if (oldProject) updates[project] = null; // kalin thibuna data ain karanna
+          if (oldProject) updates[project] = null;
           return;
         }
 
@@ -1594,7 +1744,6 @@ async function runQueueCycle() {
       }
     });
 
-    // Server Projects eken ain karapu projects queue_monitor eken ain karanawa
     const projectSet = new Set(projects);
     for (const key of Object.keys(queueMirror)) {
       if (!projectSet.has(key)) updates[key] = null;
@@ -1664,7 +1813,7 @@ function startQueueAutoLoop() {
 */
 async function fetchStaffLookup() {
   try {
-    const response = await axios.get(STAFF_SHEET_URL, { responseType: 'text' });
+    const response = await axios.get(STAFF_SHEET_URL, { responseType: 'text', timeout: 30000 });
     return response.data;
   } catch (err) {
     console.error('Staff lookup error:', err.message);
@@ -1765,8 +1914,6 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
   const query = parsed.query;
 
-  // /fetch-filtered saha /planning-ui walata Basic Auth oni na (kalin widihatama).
-  // Anith okkoma endpoints (/fetch-outflow, /fetch-cancellation, /queue-monitor/* ekath ekka) Basic Auth oni.
   const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
@@ -1794,23 +1941,38 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 1: TEAM LEADER — /fetch-all?mode=tl&date=YYYY-MM-DD  (default mode)
+    // MODE 1: TEAM LEADER (TL HOURLY)
+    //   /fetch-all                                   -> default TEAM_LEADERS (roster staff IDs)
+    //   /fetch-all?shift_sup=Thevidu                 -> Shift Sup ge okkoma staff
+    //   /fetch-all?shift_sup=All                     -> roster eke okkoma staff
+    //   /fetch-all?shift_sup=Thevidu&team_leader=G1-OTL -> eka TL ge staff
+    //   /fetch-all?tl_names=A,B                      -> TL list (roster staff IDs)
     // -------------------------------------------------------------
     if (pathname === "/fetch-all" && req.method === "GET" && (!query.mode || query.mode === "tl")) {
-      const requestedIds = parseIdsParam(query);
       const dateStr = parseDateParam(query);
-      const allData = await fetchAllTeamLeaders(requestedIds, dateStr);
-      await saveToFirebase(FIREBASE_PATH_TL, {
-        updated_at: new Date().toISOString(),
-        date: dateStr || "today",
-        total_leaders: allData.length,
-        data: allData
-      });
+      const shiftSup = query.shift_sup ? String(query.shift_sup).trim() : "";
+      const teamLeader = query.team_leader ? String(query.team_leader).trim() : "";
+      const requestedIds = parseIdsParam(query);
+
+      let allData;
+      let filterConfig;
+
+      if (shiftSup || teamLeader) {
+        allData = await fetchTeamLeadersByScope({ shiftSup, teamLeader }, dateStr);
+        filterConfig = { shift_sup: shiftSup || "All", team_leader: teamLeader || "All", date: dateStr || "today" };
+      } else {
+        allData = await fetchAllTeamLeaders(requestedIds, dateStr);
+        filterConfig = { tl_names: requestedIds.length ? requestedIds : TEAM_LEADERS, date: dateStr || "today" };
+      }
+
+      await saveTLHourly(allData, { date: dateStr || "today", filter_config: filterConfig });
+
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         mode: "tl",
         date: dateStr || "today",
+        filter_config: filterConfig,
         data: allData,
         total_leaders: allData.length,
         updated_at: new Date().toISOString()
@@ -1875,12 +2037,9 @@ const server = http.createServer(async (req, res) => {
 
       const tlName = String(query.tl_name || TEAM_LEADERS[0]).trim();
       const data = await fetchSingleTL(tlName, dateStr);
-      await saveToFirebase(FIREBASE_PATH_TL, {
-        updated_at: new Date().toISOString(),
+      await saveTLHourly([data], {
         date: dateStr || "today",
-        total_rows: data.total_rows,
         filter_config: { tl_name: tlName, date: dateStr || "today" },
-        data: data.rows,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1896,7 +2055,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
-    // MODE 3: PROJECT + TASK FILTERED — /fetch-filtered?project=&task=&date=YYYY-MM-DD
+    // MODE 3: PROJECT + TASK FILTERED
     // -------------------------------------------------------------
     if (pathname === "/fetch-filtered" && req.method === "GET") {
       const project = (query.project || "").trim();
@@ -1933,13 +2092,6 @@ const server = http.createServer(async (req, res) => {
 
     // -------------------------------------------------------------
     // MODE 5: PROJECT OUTFLOW
-    //   /fetch-outflow                                 -> today  (saved to Firebase)
-    //   /fetch-outflow?range=yesterday|day_before|last_week|today
-    //   /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD   -> custom range
-    //   /fetch-outflow?date=YYYY-MM-DD                 -> single day (legacy)
-    // Only "today" is written to Firebase (project-gap.json). Past dates / ranges
-    // are returned in the response only, so they never overwrite today's data.
-    // Response: { success, mode, range, date, from, to, rows, total, updated_at, saved_to_firebase }
     // -------------------------------------------------------------
     if (pathname === "/fetch-outflow" && req.method === "GET") {
       const resolved = resolveOutflowRange(query);
@@ -1953,11 +2105,11 @@ const server = http.createServer(async (req, res) => {
       let rows, updatedAt;
 
       if (isToday) {
-        const payload = await refreshOutflow(); // fetch + save to Firebase
+        const payload = await refreshOutflow();
         rows = payload.data;
         updatedAt = payload.lastUpdated;
       } else {
-        rows = await fetchOutflow(from, to); // fetch only, no Firebase write
+        rows = await fetchOutflow(from, to);
         updatedAt = new Date().toISOString();
       }
 
@@ -1979,12 +2131,6 @@ const server = http.createServer(async (req, res) => {
 
     // -------------------------------------------------------------
     // MODE 7: CANCELLATION
-    //   /fetch-cancellation                               -> okkoma data
-    //   /fetch-cancellation?staff_ids=G123,G456-OTL       -> staff filter (prefix match)
-    //   /fetch-cancellation?staff_ids=G123&date=YYYY-MM-DD -> staff + date
-    //   /cancellation-columns                             -> table eke columns
-    // Data cancellation-7294a Firebase (qat_cancelation_data) ekata save wenawa.
-    // (Call karana gamama e node eka full replace wenawa.)
     // -------------------------------------------------------------
     if (pathname === "/fetch-cancellation" && req.method === "GET") {
       const staffIds = parseIdsParam(query);
@@ -2030,8 +2176,6 @@ const server = http.createServer(async (req, res) => {
 
     // -------------------------------------------------------------
     // MODE 6: QUEUE MONITOR
-    //   GET /queue-monitor/status   -> last run info + config
-    //   GET /queue-monitor/refresh  -> cycle ekak ekhama run karanawa
     // -------------------------------------------------------------
     if (pathname === "/queue-monitor/status" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -2059,7 +2203,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: "A queue monitor cycle is already running" }));
         return;
       }
-      await getQueueProjects(true); // project list eka force refresh
+      await getQueueProjects(true);
       const summary = await runQueueCycle();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -2088,8 +2232,6 @@ const server = http.createServer(async (req, res) => {
     // -------------------------------------------------------------
     // MODE 4: PLANNING
     // -------------------------------------------------------------
-
-    // GET /planning  -> list every planning entry
     if (pathname === "/planning" && req.method === "GET") {
       const planningMap = (await getFromFirebase(FIREBASE_PATH_PLANNING)) || {};
       const list = Object.entries(planningMap).map(([id, entry]) => ({ id, ...entry }));
@@ -2098,7 +2240,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // POST /planning  -> add a new { project_name, task_name, target } entry
     if (pathname === "/planning" && req.method === "POST") {
       let body;
       try {
@@ -2134,7 +2275,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // DELETE /planning?id=xxx  -> remove a planning entry
     if (pathname === "/planning" && req.method === "DELETE") {
       const id = String(query.id || "").trim();
       if (!id) {
@@ -2148,7 +2288,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // GET /planning-fetch?date=YYYY-MM-DD
     if (pathname === "/planning-fetch" && req.method === "GET") {
       const dateStr = parseDateParam(query);
       const updated = await refreshAllPlanning(dateStr);
@@ -2188,7 +2327,7 @@ const server = http.createServer(async (req, res) => {
     // Denominator lookup
     if (pathname === "/denominator-lookup" && req.method === "GET") {
       try {
-        const data = await getDenominatorData(true); // force refresh
+        const data = await getDenominatorData(true);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           success: true,
@@ -2238,7 +2377,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  🔐 Basic Auth user: ${AUTH_USER}`);
   console.log(`  🌐 CORS: Enabled for all origins`);
   console.log(`  🔥 Firebase paths:`);
-  console.log(`     TL mode      -> ${FIREBASE_PATH_TL}`);
+  console.log(`     TL mode      -> ${FIREBASE_PATH_TL}  (team_leaders/<TL_ID>/{staff_ids,rows})`);
   console.log(`     Staff mode   -> ${FIREBASE_PATH_STAFF}`);
   console.log(`     Filtered     -> ${FIREBASE_PATH_FILTERED}`);
   console.log(`     Planning     -> ${FIREBASE_PATH_PLANNING}`);
@@ -2246,12 +2385,12 @@ server.listen(PORT, HOST, () => {
   console.log(`     Queue        -> ${QUEUE_FIREBASE_URL}`);
   console.log(`     Queue source -> ${SERVER_PROJECTS_URL}`);
   console.log(`     Cancellation -> ${CANCELLATION_FIREBASE_URL}`);
-  console.log(`  🆔 ID matching: case-insensitive + prefix (G12345 -> G12345-OTL, G12345-QAQC ...)`);
+  console.log(`  🆔 TL Hourly: roster (staff sheet) staff IDs walin query wenawa`);
   console.log(`  📊 Endpoints (most accept optional &date=YYYY-MM-DD):`);
   console.log(`    GET  /                                  - Health check`);
-  console.log(`    GET  /fetch-all?mode=tl                 - Fetch all Team Leaders -> ${FIREBASE_PATH_TL}`);
+  console.log(`    GET  /fetch-all?shift_sup=&team_leader= - TL Hourly (roster staff IDs) -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch-all?mode=staff&staff_ids=A,B - Fetch given staff_ids -> ${FIREBASE_PATH_STAFF}`);
-  console.log(`    GET  /fetch?tl_name=                    - Single TL fetch -> ${FIREBASE_PATH_TL}`);
+  console.log(`    GET  /fetch?tl_name=                    - Single TL fetch (roster first) -> ${FIREBASE_PATH_TL}`);
   console.log(`    GET  /fetch?staff_id=                   - Single staff fetch -> ${FIREBASE_PATH_STAFF}`);
   console.log(`    GET  /fetch-filtered?project=&task=     - Project+Task filtered -> ${FIREBASE_PATH_FILTERED}`);
   console.log(`    GET  /fetch-outflow                     - Project outflow (today) -> project-gap.json`);
@@ -2272,9 +2411,6 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /team-leaders | /staff-ids         - Default ID list`);
   console.log("================================");
 
-  // MODE 5 background auto-refresh (kalin standalone script eke loop eka wage)
   startOutflowAutoLoop();
-
-  // MODE 6 background queue monitor loop (Server Projects -> Grafana -> queue_monitor)
   startQueueAutoLoop();
 });
