@@ -548,12 +548,65 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 | BUILD SQL — variants (team leader / staff id / project+task / outflow)
 |--------------------------------------------------------------------------
 */
-function buildQueryByTeamLeader(tlName, dateStr) {
+/*
+|--------------------------------------------------------------------------
+| TL HOURLY - optional processing_time column
+|--------------------------------------------------------------------------
+| tl_hourly_report table eke "processing_time" column ekak (numeric) thiyenawanam
+| TL mode (Mode 1) query ekata SUM(processing_time) AS processing_time ekathu
+| wenawa, e nisa TL Hourly Firebase eke ekath yanawa. Nathnam / numeric nemei
+| nam skip wenawa (TL fetch eka nawathinne na). Detect una eka 10 minutes cache.
+|--------------------------------------------------------------------------
+*/
+const TL_REPORT_DATASET = "trax-retail.backoffice";
+const TL_REPORT_TABLE = "tl_hourly_report";
+const NUMERIC_TYPE_RE = /^(INT64|FLOAT64|NUMERIC|BIGNUMERIC)/;
+let tlProcessingCache = { promise: null, ts: 0 };
+
+function detectTlProcessingTime(force = false) {
+  const now = Date.now();
+  if (!force && tlProcessingCache.promise && now - tlProcessingCache.ts < 10 * 60 * 1000) {
+    return tlProcessingCache.promise;
+  }
+  tlProcessingCache.ts = now;
+  tlProcessingCache.promise = (async () => {
+    try {
+      const info = await runBigQuery({
+        query: "#standardSQL\nSELECT column_name, data_type FROM `" + TL_REPORT_DATASET +
+               ".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '" + TL_REPORT_TABLE +
+               "' AND LOWER(column_name) = 'processing_time'",
+        useLegacySql: false,
+      }, 10);
+      if (!info.length) {
+        console.log("  ℹ️ [TL] processing_time column eka tl_hourly_report eke na - skip");
+        return null;
+      }
+      const type = String(info[0].data_type).toUpperCase();
+      if (!NUMERIC_TYPE_RE.test(type)) {
+        console.warn(`  ⚠️ [TL] processing_time numeric nemei (${type}) - skip`);
+        return null;
+      }
+      console.log(`  ✅ [TL] processing_time column hambuna (${type}) - TL Hourly ekata ekathu wenawa`);
+      return info[0].column_name;
+    } catch (err) {
+      console.error("  ❌ [TL] processing_time detect karanna ba:", err.message);
+      tlProcessingCache.promise = null; // ayeth try karanna
+      return null;
+    }
+  })();
+  return tlProcessingCache.promise;
+}
+
+function buildQueryByTeamLeader(tlName, dateStr, ptColumn) {
   // Case-insensitive + trimmed + PREFIX match:
   //   "g26658"      -> G26658, G26658-OTL, G26658-QAQC ...
   //   "g26658-otl"  -> G26658-OTL only
   const idMatch = buildIdMatchSql("team_leader_staff_id", tlName);
   const dateClause = buildDateRangeClause(dateStr);
+  // processing_time column eka table eke thiyenawanam (numeric) ekath add wenawa
+  const ptSelect = ptColumn && COLUMN_NAME_RE.test(ptColumn)
+    ? `,\n        SUM(\`${ptColumn}\`) AS processing_time`
+    : "";
   return {
     query: `
       #standardSQL
@@ -568,7 +621,7 @@ function buildQueryByTeamLeader(tlName, dateStr) {
             WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
             ELSE count
           END
-        ) AS value
+        ) AS value${ptSelect}
       FROM \`trax-retail.backoffice.tl_hourly_report\`
       WHERE
         ${dateClause}
@@ -746,6 +799,8 @@ function processResults(result) {
         staff_id: obj.staff_id || "",
         value: Number(obj.value || 0),
       };
+      // TL mode eke processing_time select karala nam (column eka thiyenawanam)
+      if ("processing_time" in obj) row.processing_time = Number(obj.processing_time || 0);
       const isPges = normKeySimple(obj.project_name) === 'pges';
       const isUFPriority = UF_PRIORITY_PROJECTS.has(normKeySimple(obj.project_name));
       if ((isTemplateNameTask(obj.task_name) || isPges || isUFPriority) && obj.template_name) {
@@ -1090,7 +1145,8 @@ async function enrichWithDenominator(rows) {
 */
 async function fetchSingleTL(tlName, dateStr) {
   console.log(`  [TL] Fetching: tl_name="${tlName}" date="${dateStr || 'today'}"`);
-  const query = buildQueryByTeamLeader(tlName, dateStr);
+  const ptColumn = await detectTlProcessingTime();
+  const query = buildQueryByTeamLeader(tlName, dateStr, ptColumn);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
