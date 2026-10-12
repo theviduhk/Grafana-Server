@@ -69,6 +69,11 @@ const path = require("path");
 |   POST /fetch-certification {staff_ids:[...], date}    -> godak IDs
 |   GET  /fetch-certification?limit=1000                 -> rows simit karanna
 |   GET  /certification-columns                          -> view columns + detected
+|
+| MODE 10 (task_outflow -> cancellation-7294a Firebase /task_outflow.json):
+|   GET  /fetch-task-outflow?staff_ids=G123&date=YYYY-MM-DD  (or &from=&to=)
+|   POST /fetch-task-outflow {staff_ids:[...], date | from,to, limit}
+|   GET  /task-outflow-columns                           -> table columns
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -192,6 +197,26 @@ const CERT_FIREBASE_URL =
   process.env.CERT_FIREBASE_URL ||
   "https://cancellation-7294a-default-rtdb.firebaseio.com/certification_tasks_raw_view.json";
 const CERT_MAX_ROWS = Math.max(1, Number(process.env.CERT_MAX_ROWS ?? 50000) || 50000);
+
+/*
+|--------------------------------------------------------------------------
+| MODE 10 CONFIG - TASK OUTFLOW (task_outflow)
+|--------------------------------------------------------------------------
+| TASK_OUTFLOW_TABLE         default trax-retail.backoffice.task_outflow
+|                            (dataset wenas nam env eken wenas karanna)
+| TASK_OUTFLOW_STAFF_COLUMN  default staff_id  (STRING)
+| TASK_OUTFLOW_DATE_COLUMN   default event_timestamp (TIMESTAMP)
+| TASK_OUTFLOW_FIREBASE_URL  default cancellation-7294a DB -> /task_outflow.json
+| TASK_OUTFLOW_MAX_ROWS      ekama call ekakin ganna max rows (default 50000)
+|--------------------------------------------------------------------------
+*/
+const TASK_OUTFLOW_TABLE = process.env.TASK_OUTFLOW_TABLE || "trax-retail.backoffice.task_outflow";
+const TASK_OUTFLOW_STAFF_COLUMN = process.env.TASK_OUTFLOW_STAFF_COLUMN || "staff_id";
+const TASK_OUTFLOW_DATE_COLUMN = process.env.TASK_OUTFLOW_DATE_COLUMN || "event_timestamp";
+const TASK_OUTFLOW_FIREBASE_URL =
+  process.env.TASK_OUTFLOW_FIREBASE_URL ||
+  "https://cancellation-7294a-default-rtdb.firebaseio.com/task_outflow.json";
+const TASK_OUTFLOW_MAX_ROWS = Math.max(1, Number(process.env.TASK_OUTFLOW_MAX_ROWS ?? 50000) || 50000);
 
 // planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
@@ -1500,6 +1525,49 @@ async function fetchCertification(staffIds, fromStr, toStr, limit) {
 
 /*
 |--------------------------------------------------------------------------
+| FETCH - MODE 10: Task Outflow (task_outflow)
+|--------------------------------------------------------------------------
+| Columns: center, email, staff_id, team_leader_staff_id, project_name,
+| event_timestamp (TIMESTAMP), event_name, task_name, number_of_probes,
+| processing_time, scene_type_uid, queue_duration
+| Date filter: DATE(event_timestamp) (UTC, wenath ewage).
+|--------------------------------------------------------------------------
+*/
+function buildQueryTaskOutflow(staffIds, fromStr, toStr, limit) {
+  if (!TABLE_NAME_RE.test(TASK_OUTFLOW_TABLE)) throw new Error("Invalid TASK_OUTFLOW_TABLE");
+  if (!COLUMN_NAME_RE.test(TASK_OUTFLOW_STAFF_COLUMN) || !COLUMN_NAME_RE.test(TASK_OUTFLOW_DATE_COLUMN)) {
+    throw new Error("Invalid TASK_OUTFLOW_STAFF_COLUMN / TASK_OUTFLOW_DATE_COLUMN");
+  }
+  const conditions = [];
+
+  if (staffIds && staffIds.length) {
+    const clauses = staffIds.map(id => buildIdMatchSql("`" + TASK_OUTFLOW_STAFF_COLUMN + "`", id));
+    conditions.push("(" + clauses.join(" OR ") + ")");
+  }
+  if (fromStr && toStr) {
+    const d = "DATE(`" + TASK_OUTFLOW_DATE_COLUMN + "`)";
+    conditions.push(fromStr === toStr
+      ? `${d} = DATE('${fromStr}')`
+      : `${d} BETWEEN DATE('${fromStr}') AND DATE('${toStr}')`);
+  }
+
+  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+  return {
+    query: "#standardSQL\nSELECT * FROM `" + TASK_OUTFLOW_TABLE + "` " + where +
+           " ORDER BY `" + TASK_OUTFLOW_DATE_COLUMN + "` LIMIT " + limit,
+    useLegacySql: false,
+  };
+}
+
+async function fetchTaskOutflow(staffIds, fromStr, toStr, limit) {
+  console.log(`\n>>> [TASK OUTFLOW] staff_ids=${staffIds && staffIds.length ? staffIds.join(",") : "ALL"} range="${fromStr ? (fromStr === toStr ? fromStr : fromStr + ".." + toStr) : "all"}" limit=${limit}`);
+  const rows = await runBigQuery(buildQueryTaskOutflow(staffIds, fromStr, toStr, limit), 60);
+  console.log(`  Rows found: ${rows.length}`);
+  return rows;
+}
+
+/*
+|--------------------------------------------------------------------------
 | MODE 6: QUEUE MONITOR
 |--------------------------------------------------------------------------
 | Flow:
@@ -2018,7 +2086,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor / Cancellation / Daily RPH / Certification)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor / Cancellation / Daily RPH / Certification / Task Outflow)",
         time: new Date().toISOString(),
         cors: "enabled",
         outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
@@ -2460,6 +2528,111 @@ const server = http.createServer(async (req, res) => {
     }
 
     // -------------------------------------------------------------
+    // MODE 10: TASK OUTFLOW (task_outflow)
+    //   /fetch-task-outflow?staff_ids=G123,G456-OTL          -> staff filter (prefix match)
+    //   /fetch-task-outflow?date=YYYY-MM-DD                  -> single day
+    //   /fetch-task-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD    -> range (max OUTFLOW_MAX_RANGE_DAYS)
+    //   /fetch-task-outflow?limit=1000                       -> rows simit karanna
+    //   POST /fetch-task-outflow {staff_ids, date | from,to, limit}
+    //   /task-outflow-columns                                -> table columns
+    // Data cancellation-7294a Firebase (task_outflow) ekata save wenawa.
+    // (Call karana gamama e node eka full replace wenawa.)
+    // -------------------------------------------------------------
+    if (pathname === "/fetch-task-outflow" && (req.method === "GET" || req.method === "POST")) {
+      let params;
+      if (req.method === "POST") {
+        try {
+          params = await readJsonBody(req);
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: err.message }));
+          return;
+        }
+      } else {
+        params = query;
+      }
+
+      const staffIds = parseIdList(params.staff_ids || params.staff_id);
+      if (staffIds.length > MAX_CANCEL_IDS) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: `Too many staff ids (${staffIds.length}). Maximum is ${MAX_CANCEL_IDS}` }));
+        return;
+      }
+
+      let from = null, to = null;
+      if (params.from || params.to) {
+        const f = parseYMD(params.from), t = parseYMD(params.to);
+        if (!f || !t) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "from and to must both be valid YYYY-MM-DD dates" }));
+          return;
+        }
+        from = f <= t ? f : t;
+        to = f <= t ? t : f;
+      } else if (params.date) {
+        const d = parseYMD(params.date);
+        if (!d) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "date must be a valid YYYY-MM-DD date" }));
+          return;
+        }
+        from = to = d;
+      }
+
+      if (from && to) {
+        const span = daysBetweenInclusive(from, to);
+        if (span > OUTFLOW_MAX_RANGE_DAYS) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: `Range too large (${span} days). Maximum is ${OUTFLOW_MAX_RANGE_DAYS} days` }));
+          return;
+        }
+      }
+
+      const reqLimit = Math.floor(Number(params.limit));
+      const limit = reqLimit > 0 ? Math.min(reqLimit, TASK_OUTFLOW_MAX_ROWS) : TASK_OUTFLOW_MAX_ROWS;
+
+      const rows = await fetchTaskOutflow(staffIds, from, to, limit);
+      const payload = {
+        updated_at: new Date().toISOString(),
+        filter_config: { staff_ids: staffIds, from: from || "all", to: to || "all", limit },
+        staff_column: TASK_OUTFLOW_STAFF_COLUMN,
+        date_column: TASK_OUTFLOW_DATE_COLUMN,
+        total_rows: rows.length,
+        truncated: rows.length >= limit,
+        data: rows,
+      };
+      await axios.put(TASK_OUTFLOW_FIREBASE_URL, payload, { timeout: 120000, maxBodyLength: Infinity, maxContentLength: Infinity });
+      console.log("  🔥 Task outflow Firebase updated (task_outflow.json)");
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, mode: "task-outflow", saved_to_firebase: true, ...payload }));
+      return;
+    }
+
+    if (pathname === "/task-outflow-columns" && req.method === "GET") {
+      const parts = TASK_OUTFLOW_TABLE.split(".");
+      if (parts.length !== 3 || !TABLE_NAME_RE.test(TASK_OUTFLOW_TABLE)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "TASK_OUTFLOW_TABLE must be project.dataset.name" }));
+        return;
+      }
+      const info = await runBigQuery({
+        query: "#standardSQL\nSELECT column_name, data_type FROM `" + parts[0] + "." + parts[1] +
+               ".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '" + sqlEscape(parts[2]) + "' ORDER BY ordinal_position",
+        useLegacySql: false,
+      }, 10);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        table: TASK_OUTFLOW_TABLE,
+        staff_column: TASK_OUTFLOW_STAFF_COLUMN,
+        date_column: TASK_OUTFLOW_DATE_COLUMN,
+        columns: info
+      }));
+      return;
+    }
+
+    // -------------------------------------------------------------
     // MODE 6: QUEUE MONITOR
     //   GET /queue-monitor/status   -> last run info + config
     //   GET /queue-monitor/refresh  -> cycle ekak ekhama run karanawa
@@ -2694,6 +2867,8 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /daily-rph-columns                 - Daily RPH table columns`);
   console.log(`    GET  /fetch-certification?staff_ids=&date= - certification_tasks_raw_view -> ${CERT_FIREBASE_URL}`);
   console.log(`    GET  /certification-columns             - Certification view columns`);
+  console.log(`    GET  /fetch-task-outflow?staff_ids=&date= - task_outflow -> ${TASK_OUTFLOW_FIREBASE_URL}`);
+  console.log(`    GET  /task-outflow-columns              - task_outflow table columns`);
   console.log(`    GET  /queue-monitor/status              - Queue monitor status`);
   console.log(`    GET  /queue-monitor/refresh             - Run one queue monitor cycle now`);
   console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
