@@ -24,10 +24,6 @@ const path = require("path");
 |        -> https://cancellation-7294a-default-rtdb.firebaseio.com/
 |           qat_cancelation_data.json
 |        staff id ekak ho godak (prefix match) denna puluwan.
-|   8. DAILY RPH BY USER (daily_rph_by_user table)
-|        GET /fetch-daily-rph?staff_ids=&date= | &from=&to=
-|        GET /daily-rph-columns
-|        staff / date column auto-detect wenawa (env eken override karanna puluwan).
 |
 | Modes 1-4 support optional `date=YYYY-MM-DD`. Date eka denne nathnam
 | (allathwa waradi format eka dunnoth) default eka widihata "today" query
@@ -58,22 +54,9 @@ const path = require("path");
 |
 | MODE 7 (cancellation):
 |   GET /fetch-cancellation                              -> okkoma data
-|   POST /fetch-cancellation {staff_ids:[...], date}      -> godak IDs (paste list)
 |   GET /fetch-cancellation?staff_ids=G123,G456-OTL      -> staff filter
 |   GET /fetch-cancellation?staff_ids=G123&date=YYYY-MM-DD
 |   GET /cancellation-columns                            -> table columns
-|
-| MODE 9 (certification_tasks_raw_view -> cancellation-7294a Firebase):
-|   GET  /fetch-certification                            -> data (max CERT_MAX_ROWS)
-|   GET  /fetch-certification?staff_ids=G123&date=YYYY-MM-DD  (or &from=&to=)
-|   POST /fetch-certification {staff_ids:[...], date}    -> godak IDs
-|   GET  /fetch-certification?limit=1000                 -> rows simit karanna
-|   GET  /certification-columns                          -> view columns + detected
-|
-| MODE 10 (task_outflow -> cancellation-7294a Firebase /task_outflow.json):
-|   GET  /fetch-task-outflow?staff_ids=G123&date=YYYY-MM-DD  (or &from=&to=)
-|   POST /fetch-task-outflow {staff_ids:[...], date | from,to, limit}
-|   GET  /task-outflow-columns                           -> table columns
 |--------------------------------------------------------------------------
 */
 const QUERY_URL =
@@ -159,64 +142,6 @@ const CANCEL_STAFF_COLUMN = process.env.CANCEL_STAFF_COLUMN || "user";
 const CANCEL_DATE_COLUMN = process.env.CANCEL_DATE_COLUMN || "timestamp";
 // Column name eka safe da kiyala check (SQL injection walakwanna)
 const COLUMN_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/*
-|--------------------------------------------------------------------------
-| MODE 8 CONFIG - DAILY RPH BY USER
-|--------------------------------------------------------------------------
-| DAILY_RPH_TABLE         table eka (default trax-retail.backoffice.daily_rph_by_user)
-| DAILY_RPH_STAFF_COLUMN  staff id column eka (nathnam auto-detect)
-| DAILY_RPH_DATE_COLUMN   date column eka (nathnam auto-detect)
-| DAILY_RPH_FIREBASE_URL  set karoth data eka Firebase ekatath PUT karanawa
-|                         (nathnam save wenne na, response ekata witharai)
-|--------------------------------------------------------------------------
-*/
-const DAILY_RPH_TABLE = process.env.DAILY_RPH_TABLE || "trax-retail.backoffice.daily_rph_by_user";
-const DAILY_RPH_STAFF_COLUMN = process.env.DAILY_RPH_STAFF_COLUMN || "";
-const DAILY_RPH_DATE_COLUMN = process.env.DAILY_RPH_DATE_COLUMN || "";
-const DAILY_RPH_FIREBASE_URL = process.env.DAILY_RPH_FIREBASE_URL || "";
-const TABLE_NAME_RE = /^[A-Za-z0-9_.\-]+$/;
-
-/*
-|--------------------------------------------------------------------------
-| MODE 9 CONFIG - CERTIFICATION (certification_tasks_raw_view)
-|--------------------------------------------------------------------------
-| CERT_TABLE           view eke full nama. Default:
-|                      trax-retail.backoffice.certification_tasks_raw_view
-|                      (dataset wenas nam env eken wenas karanna)
-| CERT_STAFF_COLUMN    staff id column eka (nathnam auto-detect)
-| CERT_DATE_COLUMN     date column eka (nathnam auto-detect)
-| CERT_FIREBASE_URL    data save wenna thena (cancellation-7294a DB)
-| CERT_MAX_ROWS        ekama call ekakin ganna max rows (default 50000)
-|--------------------------------------------------------------------------
-*/
-const CERT_TABLE = process.env.CERT_TABLE || "trax-retail.backoffice.certification_tasks_raw_view";
-const CERT_STAFF_COLUMN = process.env.CERT_STAFF_COLUMN || "";
-const CERT_DATE_COLUMN = process.env.CERT_DATE_COLUMN || "";
-const CERT_FIREBASE_URL =
-  process.env.CERT_FIREBASE_URL ||
-  "https://cancellation-7294a-default-rtdb.firebaseio.com/certification_tasks_raw_view.json";
-const CERT_MAX_ROWS = Math.max(1, Number(process.env.CERT_MAX_ROWS ?? 50000) || 50000);
-
-/*
-|--------------------------------------------------------------------------
-| MODE 10 CONFIG - TASK OUTFLOW (task_outflow)
-|--------------------------------------------------------------------------
-| TASK_OUTFLOW_TABLE         default trax-retail.backoffice.task_outflow
-|                            (dataset wenas nam env eken wenas karanna)
-| TASK_OUTFLOW_STAFF_COLUMN  default staff_id  (STRING)
-| TASK_OUTFLOW_DATE_COLUMN   default event_timestamp (TIMESTAMP)
-| TASK_OUTFLOW_FIREBASE_URL  default cancellation-7294a DB -> /task_outflow.json
-| TASK_OUTFLOW_MAX_ROWS      ekama call ekakin ganna max rows (default 50000)
-|--------------------------------------------------------------------------
-*/
-const TASK_OUTFLOW_TABLE = process.env.TASK_OUTFLOW_TABLE || "trax-retail.backoffice.task_outflow";
-const TASK_OUTFLOW_STAFF_COLUMN = process.env.TASK_OUTFLOW_STAFF_COLUMN || "staff_id";
-const TASK_OUTFLOW_DATE_COLUMN = process.env.TASK_OUTFLOW_DATE_COLUMN || "event_timestamp";
-const TASK_OUTFLOW_FIREBASE_URL =
-  process.env.TASK_OUTFLOW_FIREBASE_URL ||
-  "https://cancellation-7294a-default-rtdb.firebaseio.com/task_outflow.json";
-const TASK_OUTFLOW_MAX_ROWS = Math.max(1, Number(process.env.TASK_OUTFLOW_MAX_ROWS ?? 50000) || 50000);
 
 // planning.html eka mema server.js eka thiyena FOLDER ekamama thiyanna oni
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
@@ -548,65 +473,12 @@ async function getQueryResults(resultUrl, maxTries = 10) {
 | BUILD SQL — variants (team leader / staff id / project+task / outflow)
 |--------------------------------------------------------------------------
 */
-/*
-|--------------------------------------------------------------------------
-| TL HOURLY - optional processing_time column
-|--------------------------------------------------------------------------
-| tl_hourly_report table eke "processing_time" column ekak (numeric) thiyenawanam
-| TL mode (Mode 1) query ekata SUM(processing_time) AS processing_time ekathu
-| wenawa, e nisa TL Hourly Firebase eke ekath yanawa. Nathnam / numeric nemei
-| nam skip wenawa (TL fetch eka nawathinne na). Detect una eka 10 minutes cache.
-|--------------------------------------------------------------------------
-*/
-const TL_REPORT_DATASET = "trax-retail.backoffice";
-const TL_REPORT_TABLE = "tl_hourly_report";
-const NUMERIC_TYPE_RE = /^(INT64|FLOAT64|NUMERIC|BIGNUMERIC)/;
-let tlProcessingCache = { promise: null, ts: 0 };
-
-function detectTlProcessingTime(force = false) {
-  const now = Date.now();
-  if (!force && tlProcessingCache.promise && now - tlProcessingCache.ts < 10 * 60 * 1000) {
-    return tlProcessingCache.promise;
-  }
-  tlProcessingCache.ts = now;
-  tlProcessingCache.promise = (async () => {
-    try {
-      const info = await runBigQuery({
-        query: "#standardSQL\nSELECT column_name, data_type FROM `" + TL_REPORT_DATASET +
-               ".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '" + TL_REPORT_TABLE +
-               "' AND LOWER(column_name) = 'processing_time'",
-        useLegacySql: false,
-      }, 10);
-      if (!info.length) {
-        console.log("  ℹ️ [TL] processing_time column eka tl_hourly_report eke na - skip");
-        return null;
-      }
-      const type = String(info[0].data_type).toUpperCase();
-      if (!NUMERIC_TYPE_RE.test(type)) {
-        console.warn(`  ⚠️ [TL] processing_time numeric nemei (${type}) - skip`);
-        return null;
-      }
-      console.log(`  ✅ [TL] processing_time column hambuna (${type}) - TL Hourly ekata ekathu wenawa`);
-      return info[0].column_name;
-    } catch (err) {
-      console.error("  ❌ [TL] processing_time detect karanna ba:", err.message);
-      tlProcessingCache.promise = null; // ayeth try karanna
-      return null;
-    }
-  })();
-  return tlProcessingCache.promise;
-}
-
-function buildQueryByTeamLeader(tlName, dateStr, ptColumn) {
+function buildQueryByTeamLeader(tlName, dateStr) {
   // Case-insensitive + trimmed + PREFIX match:
   //   "g26658"      -> G26658, G26658-OTL, G26658-QAQC ...
   //   "g26658-otl"  -> G26658-OTL only
   const idMatch = buildIdMatchSql("team_leader_staff_id", tlName);
   const dateClause = buildDateRangeClause(dateStr);
-  // processing_time column eka table eke thiyenawanam (numeric) ekath add wenawa
-  const ptSelect = ptColumn && COLUMN_NAME_RE.test(ptColumn)
-    ? `,\n        SUM(\`${ptColumn}\`) AS processing_time`
-    : "";
   return {
     query: `
       #standardSQL
@@ -621,7 +493,7 @@ function buildQueryByTeamLeader(tlName, dateStr, ptColumn) {
             WHEN LOWER(TRIM(task_name)) = 'stitching' THEN number_of_probes
             ELSE count
           END
-        ) AS value${ptSelect}
+        ) AS value
       FROM \`trax-retail.backoffice.tl_hourly_report\`
       WHERE
         ${dateClause}
@@ -799,8 +671,6 @@ function processResults(result) {
         staff_id: obj.staff_id || "",
         value: Number(obj.value || 0),
       };
-      // TL mode eke processing_time select karala nam (column eka thiyenawanam)
-      if ("processing_time" in obj) row.processing_time = Number(obj.processing_time || 0);
       const isPges = normKeySimple(obj.project_name) === 'pges';
       const isUFPriority = UF_PRIORITY_PROJECTS.has(normKeySimple(obj.project_name));
       if ((isTemplateNameTask(obj.task_name) || isPges || isUFPriority) && obj.template_name) {
@@ -1145,8 +1015,7 @@ async function enrichWithDenominator(rows) {
 */
 async function fetchSingleTL(tlName, dateStr) {
   console.log(`  [TL] Fetching: tl_name="${tlName}" date="${dateStr || 'today'}"`);
-  const ptColumn = await detectTlProcessingTime();
-  const query = buildQueryByTeamLeader(tlName, dateStr, ptColumn);
+  const query = buildQueryByTeamLeader(tlName, dateStr);
   const response = await grafanaRequest('POST', QUERY_URL, query);
   const jobId = response.data.jobReference.jobId;
   const location = response.data.jobReference.location;
@@ -1412,212 +1281,6 @@ async function runBigQuery(query, maxTries = 30) {
 async function fetchCancellation(staffIds, dateStr) {
   console.log(`\n>>> [CANCEL] staff_ids=${staffIds && staffIds.length ? staffIds.join(",") : "ALL"} date="${dateStr || 'all'}"`);
   const rows = await runBigQuery(buildQueryCancellation(staffIds, dateStr));
-  console.log(`  Rows found: ${rows.length}`);
-  return rows;
-}
-
-/*
-|--------------------------------------------------------------------------
-| FETCH - MODE 8: Daily RPH by user
-|--------------------------------------------------------------------------
-| Columns env eken dunne nathnam INFORMATION_SCHEMA eken auto-detect karanawa:
-|   staff column -> STRING column ekak (staff_id / user / user_id / qat_id ...)
-|   date column  -> DATE / TIMESTAMP / DATETIME column ekak (date / day / timestamp ...)
-| Detect una eka 10 minutes cache wenawa.
-|--------------------------------------------------------------------------
-*/
-let dailyRphCols = { data: null, ts: 0 };
-
-async function detectDailyRphColumns(force = false) {
-  const now = Date.now();
-  if (!force && dailyRphCols.data && now - dailyRphCols.ts < 10 * 60 * 1000) return dailyRphCols.data;
-
-  if (!TABLE_NAME_RE.test(DAILY_RPH_TABLE)) throw new Error("Invalid DAILY_RPH_TABLE");
-  const parts = DAILY_RPH_TABLE.split(".");
-  if (parts.length !== 3) throw new Error("DAILY_RPH_TABLE must be project.dataset.table");
-  const [proj, dataset, table] = parts;
-
-  const info = await runBigQuery({
-    query: "#standardSQL\nSELECT column_name, data_type FROM `" + proj + "." + dataset +
-           ".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '" + sqlEscape(table) + "' ORDER BY ordinal_position",
-    useLegacySql: false,
-  }, 10);
-  if (!info.length) throw new Error(`Table not found or has no columns: ${DAILY_RPH_TABLE}`);
-
-  const lower = (x) => String(x).toLowerCase();
-  const strCols = info.filter(c => lower(c.data_type) === "string").map(c => c.column_name);
-  const dateCols = info.filter(c => ["date", "timestamp", "datetime"].includes(lower(c.data_type))).map(c => c.column_name);
-  const pick = (cands, prefs) => {
-    for (const pref of prefs) {
-      const f = cands.find(c => lower(c) === pref);
-      if (f) return f;
-    }
-    return cands[0] || null;
-  };
-
-  const staff = DAILY_RPH_STAFF_COLUMN ||
-    pick(strCols, ["staff_id", "user", "user_id", "qat_id", "username", "staff", "email"]);
-  const date = DAILY_RPH_DATE_COLUMN ||
-    pick(dateCols, ["date", "day", "event_date", "report_date", "timestamp", "event_timestamp"]);
-
-  const data = { staff, date, columns: info };
-  dailyRphCols = { data, ts: now };
-  return data;
-}
-
-function buildQueryDailyRph(staffCol, dateCol, staffIds, fromStr, toStr) {
-  const conditions = [];
-
-  if (staffIds && staffIds.length) {
-    if (!staffCol || !COLUMN_NAME_RE.test(staffCol)) throw new Error("Staff column not found - set DAILY_RPH_STAFF_COLUMN");
-    const clauses = staffIds.map(id => buildIdMatchSql("`" + staffCol + "`", id));
-    conditions.push("(" + clauses.join(" OR ") + ")");
-  }
-  if (fromStr && toStr) {
-    if (!dateCol || !COLUMN_NAME_RE.test(dateCol)) throw new Error("Date column not found - set DAILY_RPH_DATE_COLUMN");
-    const d = "DATE(`" + dateCol + "`)";
-    conditions.push(fromStr === toStr
-      ? `${d} = DATE('${fromStr}')`
-      : `${d} BETWEEN DATE('${fromStr}') AND DATE('${toStr}')`);
-  }
-
-  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-  const order = dateCol && COLUMN_NAME_RE.test(dateCol) ? " ORDER BY `" + dateCol + "`" : "";
-  return {
-    query: "#standardSQL\nSELECT * FROM `" + DAILY_RPH_TABLE + "` " + where + order,
-    useLegacySql: false,
-  };
-}
-
-async function fetchDailyRph(staffIds, fromStr, toStr) {
-  const detected = await detectDailyRphColumns();
-  console.log(`\n>>> [DAILY RPH] staff_ids=${staffIds && staffIds.length ? staffIds.join(",") : "ALL"} range="${fromStr ? (fromStr === toStr ? fromStr : fromStr + ".." + toStr) : "all"}" (staff col=${detected.staff}, date col=${detected.date})`);
-  const rows = await runBigQuery(buildQueryDailyRph(detected.staff, detected.date, staffIds, fromStr, toStr));
-  console.log(`  Rows found: ${rows.length}`);
-  return { rows, staff_column: detected.staff, date_column: detected.date };
-}
-
-/*
-|--------------------------------------------------------------------------
-| FETCH - MODE 9: Certification (certification_tasks_raw_view)
-|--------------------------------------------------------------------------
-| Columns env eken dunne nathnam INFORMATION_SCHEMA eken auto-detect karanawa
-| (preferred names witharak - hambune nathnam null, filter eka error ekak denawa).
-| Detect una eka 10 minutes cache wenawa.
-|--------------------------------------------------------------------------
-*/
-let certCols = { data: null, ts: 0 };
-
-async function detectCertColumns(force = false) {
-  const now = Date.now();
-  if (!force && certCols.data && now - certCols.ts < 10 * 60 * 1000) return certCols.data;
-
-  if (!TABLE_NAME_RE.test(CERT_TABLE)) throw new Error("Invalid CERT_TABLE");
-  const parts = CERT_TABLE.split(".");
-  if (parts.length !== 3) throw new Error("CERT_TABLE must be project.dataset.name");
-  const [proj, dataset, table] = parts;
-
-  const info = await runBigQuery({
-    query: "#standardSQL\nSELECT column_name, data_type FROM `" + proj + "." + dataset +
-           ".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '" + sqlEscape(table) + "' ORDER BY ordinal_position",
-    useLegacySql: false,
-  }, 10);
-  if (!info.length) throw new Error(`View not found or has no columns: ${CERT_TABLE}`);
-
-  const lower = (x) => String(x).toLowerCase();
-  const strCols = info.filter(c => lower(c.data_type) === "string").map(c => c.column_name);
-  const dateCols = info.filter(c => ["date", "timestamp", "datetime"].includes(lower(c.data_type))).map(c => c.column_name);
-  const pickStrict = (cands, prefs) => {
-    for (const pref of prefs) {
-      const f = cands.find(c => lower(c) === pref);
-      if (f) return f;
-    }
-    return null;
-  };
-
-  const staff = CERT_STAFF_COLUMN ||
-    pickStrict(strCols, ["staff_id", "user", "user_id", "qat_id", "username", "staff", "email"]);
-  const date = CERT_DATE_COLUMN ||
-    pickStrict(dateCols, ["report_date", "date", "day", "event_date", "timestamp", "event_timestamp", "created_at"]);
-
-  const data = { staff, date, columns: info };
-  certCols = { data, ts: now };
-  return data;
-}
-
-function buildQueryCertification(staffCol, dateCol, staffIds, fromStr, toStr, limit) {
-  if (!TABLE_NAME_RE.test(CERT_TABLE)) throw new Error("Invalid CERT_TABLE");
-  const conditions = [];
-
-  if (staffIds && staffIds.length) {
-    if (!staffCol || !COLUMN_NAME_RE.test(staffCol)) throw new Error("Staff column not found - set CERT_STAFF_COLUMN (see /certification-columns)");
-    const clauses = staffIds.map(id => buildIdMatchSql("`" + staffCol + "`", id));
-    conditions.push("(" + clauses.join(" OR ") + ")");
-  }
-  if (fromStr && toStr) {
-    if (!dateCol || !COLUMN_NAME_RE.test(dateCol)) throw new Error("Date column not found - set CERT_DATE_COLUMN (see /certification-columns)");
-    const d = "DATE(`" + dateCol + "`)";
-    conditions.push(fromStr === toStr
-      ? `${d} = DATE('${fromStr}')`
-      : `${d} BETWEEN DATE('${fromStr}') AND DATE('${toStr}')`);
-  }
-
-  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-  const order = dateCol && COLUMN_NAME_RE.test(dateCol) ? " ORDER BY `" + dateCol + "`" : "";
-  return {
-    query: "#standardSQL\nSELECT * FROM `" + CERT_TABLE + "` " + where + order + " LIMIT " + limit,
-    useLegacySql: false,
-  };
-}
-
-async function fetchCertification(staffIds, fromStr, toStr, limit) {
-  const needDetect = (staffIds && staffIds.length) || (fromStr && toStr);
-  const detected = needDetect ? await detectCertColumns() : { staff: CERT_STAFF_COLUMN || null, date: CERT_DATE_COLUMN || null };
-  console.log(`\n>>> [CERT] staff_ids=${staffIds && staffIds.length ? staffIds.join(",") : "ALL"} range="${fromStr ? (fromStr === toStr ? fromStr : fromStr + ".." + toStr) : "all"}" limit=${limit} (staff col=${detected.staff}, date col=${detected.date})`);
-  const rows = await runBigQuery(buildQueryCertification(detected.staff, detected.date, staffIds, fromStr, toStr, limit), 60);
-  console.log(`  Rows found: ${rows.length}`);
-  return { rows, staff_column: detected.staff, date_column: detected.date };
-}
-
-/*
-|--------------------------------------------------------------------------
-| FETCH - MODE 10: Task Outflow (task_outflow)
-|--------------------------------------------------------------------------
-| Columns: center, email, staff_id, team_leader_staff_id, project_name,
-| event_timestamp (TIMESTAMP), event_name, task_name, number_of_probes,
-| processing_time, scene_type_uid, queue_duration
-| Date filter: DATE(event_timestamp) (UTC, wenath ewage).
-|--------------------------------------------------------------------------
-*/
-function buildQueryTaskOutflow(staffIds, fromStr, toStr, limit) {
-  if (!TABLE_NAME_RE.test(TASK_OUTFLOW_TABLE)) throw new Error("Invalid TASK_OUTFLOW_TABLE");
-  if (!COLUMN_NAME_RE.test(TASK_OUTFLOW_STAFF_COLUMN) || !COLUMN_NAME_RE.test(TASK_OUTFLOW_DATE_COLUMN)) {
-    throw new Error("Invalid TASK_OUTFLOW_STAFF_COLUMN / TASK_OUTFLOW_DATE_COLUMN");
-  }
-  const conditions = [];
-
-  if (staffIds && staffIds.length) {
-    const clauses = staffIds.map(id => buildIdMatchSql("`" + TASK_OUTFLOW_STAFF_COLUMN + "`", id));
-    conditions.push("(" + clauses.join(" OR ") + ")");
-  }
-  if (fromStr && toStr) {
-    const d = "DATE(`" + TASK_OUTFLOW_DATE_COLUMN + "`)";
-    conditions.push(fromStr === toStr
-      ? `${d} = DATE('${fromStr}')`
-      : `${d} BETWEEN DATE('${fromStr}') AND DATE('${toStr}')`);
-  }
-
-  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
-  return {
-    query: "#standardSQL\nSELECT * FROM `" + TASK_OUTFLOW_TABLE + "` " + where +
-           " ORDER BY `" + TASK_OUTFLOW_DATE_COLUMN + "` LIMIT " + limit,
-    useLegacySql: false,
-  };
-}
-
-async function fetchTaskOutflow(staffIds, fromStr, toStr, limit) {
-  console.log(`\n>>> [TASK OUTFLOW] staff_ids=${staffIds && staffIds.length ? staffIds.join(",") : "ALL"} range="${fromStr ? (fromStr === toStr ? fromStr : fromStr + ".." + toStr) : "all"}" limit=${limit}`);
-  const rows = await runBigQuery(buildQueryTaskOutflow(staffIds, fromStr, toStr, limit), 60);
   console.log(`  Rows found: ${rows.length}`);
   return rows;
 }
@@ -2060,27 +1723,6 @@ function parseIdsParam(query) {
   return String(raw).split(',').map(s => s.trim()).filter(Boolean);
 }
 
-// Pasted ID list: comma / space / newline / tab / semicolon separated, dedupe (case-insensitive).
-// Array ho string ho dunnath wada karanawa.
-const MAX_CANCEL_IDS = Number(process.env.MAX_CANCEL_IDS ?? 2000);
-function parseIdList(raw) {
-  if (raw === undefined || raw === null) return [];
-  const parts = Array.isArray(raw) ? raw.map(String) : [String(raw)];
-  const seen = new Set();
-  const out = [];
-  for (const part of parts) {
-    for (const t of part.split(/[\s,;]+/)) {
-      const id = t.trim();
-      if (!id) continue;
-      const k = id.toUpperCase();
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push(id);
-    }
-  }
-  return out;
-}
-
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -2142,7 +1784,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor / Cancellation / Daily RPH / Certification / Task Outflow)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor / Cancellation)",
         time: new Date().toISOString(),
         cors: "enabled",
         outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
@@ -2344,35 +1986,10 @@ const server = http.createServer(async (req, res) => {
     // Data cancellation-7294a Firebase (qat_cancelation_data) ekata save wenawa.
     // (Call karana gamama e node eka full replace wenawa.)
     // -------------------------------------------------------------
-    if (pathname === "/fetch-cancellation" && (req.method === "GET" || req.method === "POST")) {
-      let staffIds, dateRaw;
-
-      if (req.method === "POST") {
-        // POST body: { "staff_ids": ["G1","G2"] | "G1\nG2, G3", "date": "YYYY-MM-DD" }
-        // Godak IDs walata (URL length limit nisa) POST use karanna.
-        let body;
-        try {
-          body = await readJsonBody(req);
-        } catch (err) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: err.message }));
-          return;
-        }
-        staffIds = parseIdList(body.staff_ids);
-        dateRaw = body.date;
-      } else {
-        staffIds = parseIdList(query.staff_ids || query.staff_id);
-        dateRaw = query.date;
-      }
-
-      if (staffIds.length > MAX_CANCEL_IDS) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: `Too many staff ids (${staffIds.length}). Maximum is ${MAX_CANCEL_IDS}` }));
-        return;
-      }
-
-      const dateStr = dateRaw ? parseYMD(dateRaw) : null;
-      if (dateRaw && !dateStr) {
+    if (pathname === "/fetch-cancellation" && req.method === "GET") {
+      const staffIds = parseIdsParam(query);
+      const dateStr = parseDateParam(query);
+      if (query.date && !dateStr) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: false, error: "date must be a valid YYYY-MM-DD date" }));
         return;
@@ -2407,283 +2024,6 @@ const server = http.createServer(async (req, res) => {
         staff_column: CANCEL_STAFF_COLUMN,
         date_column: CANCEL_DATE_COLUMN,
         columns: rows
-      }));
-      return;
-    }
-
-    // -------------------------------------------------------------
-    // MODE 8: DAILY RPH BY USER
-    //   /fetch-daily-rph                                  -> okkoma data
-    //   /fetch-daily-rph?staff_ids=G123,G456-OTL          -> staff filter (prefix match)
-    //   /fetch-daily-rph?date=YYYY-MM-DD                  -> single day
-    //   /fetch-daily-rph?from=YYYY-MM-DD&to=YYYY-MM-DD    -> range (max OUTFLOW_MAX_RANGE_DAYS)
-    //   /daily-rph-columns                                -> table columns + detected columns
-    // DAILY_RPH_FIREBASE_URL env set karala nam data eka Firebase ekatath save wenawa.
-    // -------------------------------------------------------------
-    if (pathname === "/fetch-daily-rph" && req.method === "GET") {
-      const staffIds = parseIdsParam(query);
-
-      let from = null, to = null;
-      if (query.from || query.to) {
-        const f = parseYMD(query.from), t = parseYMD(query.to);
-        if (!f || !t) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "from and to must both be valid YYYY-MM-DD dates" }));
-          return;
-        }
-        from = f <= t ? f : t;
-        to = f <= t ? t : f;
-      } else if (query.date) {
-        const d = parseDateParam(query);
-        if (!d) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "date must be a valid YYYY-MM-DD date" }));
-          return;
-        }
-        from = to = d;
-      }
-
-      if (from && to) {
-        const span = daysBetweenInclusive(from, to);
-        if (span > OUTFLOW_MAX_RANGE_DAYS) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: `Range too large (${span} days). Maximum is ${OUTFLOW_MAX_RANGE_DAYS} days` }));
-          return;
-        }
-      }
-
-      const result = await fetchDailyRph(staffIds, from, to);
-      const payload = {
-        updated_at: new Date().toISOString(),
-        filter_config: { staff_ids: staffIds, from: from || "all", to: to || "all" },
-        staff_column: result.staff_column,
-        date_column: result.date_column,
-        total_rows: result.rows.length,
-        data: result.rows,
-      };
-
-      let saved = false;
-      if (DAILY_RPH_FIREBASE_URL) {
-        await axios.put(DAILY_RPH_FIREBASE_URL, payload, { timeout: 60000 });
-        saved = true;
-        console.log("  🔥 Daily RPH Firebase updated");
-      }
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, mode: "daily-rph", saved_to_firebase: saved, ...payload }));
-      return;
-    }
-
-    if (pathname === "/daily-rph-columns" && req.method === "GET") {
-      const d = await detectDailyRphColumns(true);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        table: DAILY_RPH_TABLE,
-        staff_column: d.staff,
-        date_column: d.date,
-        columns: d.columns
-      }));
-      return;
-    }
-
-    // -------------------------------------------------------------
-    // MODE 9: CERTIFICATION (certification_tasks_raw_view)
-    //   /fetch-certification                                  -> data (max CERT_MAX_ROWS)
-    //   /fetch-certification?staff_ids=G123,G456-OTL          -> staff filter (prefix match)
-    //   /fetch-certification?date=YYYY-MM-DD                  -> single day
-    //   /fetch-certification?from=YYYY-MM-DD&to=YYYY-MM-DD    -> range (max OUTFLOW_MAX_RANGE_DAYS)
-    //   /fetch-certification?limit=1000                       -> rows simit karanna
-    //   POST /fetch-certification {staff_ids, date | from,to, limit}
-    //   /certification-columns                                -> view columns + detected columns
-    // Data cancellation-7294a Firebase (certification_tasks_raw_view) ekata save wenawa.
-    // (Call karana gamama e node eka full replace wenawa.)
-    // -------------------------------------------------------------
-    if (pathname === "/fetch-certification" && (req.method === "GET" || req.method === "POST")) {
-      let params;
-      if (req.method === "POST") {
-        try {
-          params = await readJsonBody(req);
-        } catch (err) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: err.message }));
-          return;
-        }
-      } else {
-        params = query;
-      }
-
-      const staffIds = parseIdList(params.staff_ids || params.staff_id);
-      if (staffIds.length > MAX_CANCEL_IDS) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: `Too many staff ids (${staffIds.length}). Maximum is ${MAX_CANCEL_IDS}` }));
-        return;
-      }
-
-      let from = null, to = null;
-      if (params.from || params.to) {
-        const f = parseYMD(params.from), t = parseYMD(params.to);
-        if (!f || !t) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "from and to must both be valid YYYY-MM-DD dates" }));
-          return;
-        }
-        from = f <= t ? f : t;
-        to = f <= t ? t : f;
-      } else if (params.date) {
-        const d = parseYMD(params.date);
-        if (!d) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "date must be a valid YYYY-MM-DD date" }));
-          return;
-        }
-        from = to = d;
-      }
-
-      if (from && to) {
-        const span = daysBetweenInclusive(from, to);
-        if (span > OUTFLOW_MAX_RANGE_DAYS) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: `Range too large (${span} days). Maximum is ${OUTFLOW_MAX_RANGE_DAYS} days` }));
-          return;
-        }
-      }
-
-      const reqLimit = Math.floor(Number(params.limit));
-      const limit = reqLimit > 0 ? Math.min(reqLimit, CERT_MAX_ROWS) : CERT_MAX_ROWS;
-
-      const result = await fetchCertification(staffIds, from, to, limit);
-      const payload = {
-        updated_at: new Date().toISOString(),
-        filter_config: { staff_ids: staffIds, from: from || "all", to: to || "all", limit },
-        staff_column: result.staff_column,
-        date_column: result.date_column,
-        total_rows: result.rows.length,
-        truncated: result.rows.length >= limit,
-        data: result.rows,
-      };
-      await axios.put(CERT_FIREBASE_URL, payload, { timeout: 120000, maxBodyLength: Infinity, maxContentLength: Infinity });
-      console.log("  🔥 Certification Firebase updated (certification_tasks_raw_view.json)");
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, mode: "certification", saved_to_firebase: true, ...payload }));
-      return;
-    }
-
-    if (pathname === "/certification-columns" && req.method === "GET") {
-      const d = await detectCertColumns(true);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        table: CERT_TABLE,
-        staff_column: d.staff,
-        date_column: d.date,
-        columns: d.columns
-      }));
-      return;
-    }
-
-    // -------------------------------------------------------------
-    // MODE 10: TASK OUTFLOW (task_outflow)
-    //   /fetch-task-outflow?staff_ids=G123,G456-OTL          -> staff filter (prefix match)
-    //   /fetch-task-outflow?date=YYYY-MM-DD                  -> single day
-    //   /fetch-task-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD    -> range (max OUTFLOW_MAX_RANGE_DAYS)
-    //   /fetch-task-outflow?limit=1000                       -> rows simit karanna
-    //   POST /fetch-task-outflow {staff_ids, date | from,to, limit}
-    //   /task-outflow-columns                                -> table columns
-    // Data cancellation-7294a Firebase (task_outflow) ekata save wenawa.
-    // (Call karana gamama e node eka full replace wenawa.)
-    // -------------------------------------------------------------
-    if (pathname === "/fetch-task-outflow" && (req.method === "GET" || req.method === "POST")) {
-      let params;
-      if (req.method === "POST") {
-        try {
-          params = await readJsonBody(req);
-        } catch (err) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: err.message }));
-          return;
-        }
-      } else {
-        params = query;
-      }
-
-      const staffIds = parseIdList(params.staff_ids || params.staff_id);
-      if (staffIds.length > MAX_CANCEL_IDS) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: `Too many staff ids (${staffIds.length}). Maximum is ${MAX_CANCEL_IDS}` }));
-        return;
-      }
-
-      let from = null, to = null;
-      if (params.from || params.to) {
-        const f = parseYMD(params.from), t = parseYMD(params.to);
-        if (!f || !t) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "from and to must both be valid YYYY-MM-DD dates" }));
-          return;
-        }
-        from = f <= t ? f : t;
-        to = f <= t ? t : f;
-      } else if (params.date) {
-        const d = parseYMD(params.date);
-        if (!d) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: "date must be a valid YYYY-MM-DD date" }));
-          return;
-        }
-        from = to = d;
-      }
-
-      if (from && to) {
-        const span = daysBetweenInclusive(from, to);
-        if (span > OUTFLOW_MAX_RANGE_DAYS) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: false, error: `Range too large (${span} days). Maximum is ${OUTFLOW_MAX_RANGE_DAYS} days` }));
-          return;
-        }
-      }
-
-      const reqLimit = Math.floor(Number(params.limit));
-      const limit = reqLimit > 0 ? Math.min(reqLimit, TASK_OUTFLOW_MAX_ROWS) : TASK_OUTFLOW_MAX_ROWS;
-
-      const rows = await fetchTaskOutflow(staffIds, from, to, limit);
-      const payload = {
-        updated_at: new Date().toISOString(),
-        filter_config: { staff_ids: staffIds, from: from || "all", to: to || "all", limit },
-        staff_column: TASK_OUTFLOW_STAFF_COLUMN,
-        date_column: TASK_OUTFLOW_DATE_COLUMN,
-        total_rows: rows.length,
-        truncated: rows.length >= limit,
-        data: rows,
-      };
-      await axios.put(TASK_OUTFLOW_FIREBASE_URL, payload, { timeout: 120000, maxBodyLength: Infinity, maxContentLength: Infinity });
-      console.log("  🔥 Task outflow Firebase updated (task_outflow.json)");
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, mode: "task-outflow", saved_to_firebase: true, ...payload }));
-      return;
-    }
-
-    if (pathname === "/task-outflow-columns" && req.method === "GET") {
-      const parts = TASK_OUTFLOW_TABLE.split(".");
-      if (parts.length !== 3 || !TABLE_NAME_RE.test(TASK_OUTFLOW_TABLE)) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: false, error: "TASK_OUTFLOW_TABLE must be project.dataset.name" }));
-        return;
-      }
-      const info = await runBigQuery({
-        query: "#standardSQL\nSELECT column_name, data_type FROM `" + parts[0] + "." + parts[1] +
-               ".INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '" + sqlEscape(parts[2]) + "' ORDER BY ordinal_position",
-        useLegacySql: false,
-      }, 10);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        success: true,
-        table: TASK_OUTFLOW_TABLE,
-        staff_column: TASK_OUTFLOW_STAFF_COLUMN,
-        date_column: TASK_OUTFLOW_DATE_COLUMN,
-        columns: info
       }));
       return;
     }
@@ -2919,12 +2259,6 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /fetch-outflow?from=YYYY-MM-DD&to=YYYY-MM-DD          - custom range (not saved)`);
   console.log(`    GET  /fetch-cancellation?staff_ids=A,B&date= - Cancellation data -> qat_cancelation_data`);
   console.log(`    GET  /cancellation-columns              - Cancellation table columns`);
-  console.log(`    GET  /fetch-daily-rph?staff_ids=&date=  - Daily RPH by user (also from=&to=)`);
-  console.log(`    GET  /daily-rph-columns                 - Daily RPH table columns`);
-  console.log(`    GET  /fetch-certification?staff_ids=&date= - certification_tasks_raw_view -> ${CERT_FIREBASE_URL}`);
-  console.log(`    GET  /certification-columns             - Certification view columns`);
-  console.log(`    GET  /fetch-task-outflow?staff_ids=&date= - task_outflow -> ${TASK_OUTFLOW_FIREBASE_URL}`);
-  console.log(`    GET  /task-outflow-columns              - task_outflow table columns`);
   console.log(`    GET  /queue-monitor/status              - Queue monitor status`);
   console.log(`    GET  /queue-monitor/refresh             - Run one queue monitor cycle now`);
   console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
