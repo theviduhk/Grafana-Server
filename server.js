@@ -8,9 +8,9 @@ const path = require("path");
 |--------------------------------------------------------------------------
 | CONFIG
 |--------------------------------------------------------------------------
-| Meka thani server ekakin thanku data 7ma type eka handle karanawa:
+| Meka thani server ekakin thanku data 8ma type eka handle karanawa:
 |   1. Team Leader (TL Hourly)   -> /TL Hourly.json
-|        *** NEW: team_leader_staff_id eken nemei, staff sheet (roster) eken
+|        *** team_leader_staff_id eken nemei, staff sheet (roster) eken
 |        select karapu Shift Sup / Team Leader ta adala STAFF IDs walata data
 |        aran, Team Leader ID eka yatathe table ekak widihata Firebase ekata
 |        save karanawa. ***
@@ -20,6 +20,8 @@ const path = require("path");
 |   5. Project Outflow (project | task | center) -> projectgap Firebase
 |   6. QUEUE MONITOR (Grafana queue total + oldest task, per project)
 |   7. CANCELLATION (qat_cancelation_data table)
+|   8. TRAX TEAM MONITOR (smart-prod.trax-cloud.com locked tasks, per project)
+|        -> GET /monitor , GET /monitor/project/<name>
 |
 | TL HOURLY (MODE 1):
 |   GET /fetch-all                                   -> default TEAM_LEADERS (roster eken staff resolve)
@@ -91,6 +93,7 @@ const CANCEL_DATE_COLUMN = process.env.CANCEL_DATE_COLUMN || "timestamp";
 const COLUMN_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const PLANNING_HTML_PATH = path.join(__dirname, "planning.html");
+const TRAX_DASHBOARD_PATH = path.join(__dirname, "dashboard.html");
 
 const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
@@ -117,13 +120,17 @@ const ROSTER_CACHE_MS = Number(process.env.ROSTER_CACHE_SEC ?? 300) * 1000;
 
 /*
 |--------------------------------------------------------------------------
-| CREDENTIALS
+| CREDENTIALS  (.env nathuwa, methanama)
 |--------------------------------------------------------------------------
 */
 const AUTH_USER = process.env.AUTH_USER || "admin";
 const AUTH_PASS = process.env.AUTH_PASS || "password123";
 const GRAFANA_USER = process.env.GRAFANA_USER || "gss.kurunegala@gssintl.biz";
 const GRAFANA_PASS = process.env.GRAFANA_PASS || "Gssk@2021";
+
+// Trax (https://smart-prod.trax-cloud.com/home) login - MODE 8 (Team Monitor)
+const TRAX_USER = process.env.TRAX_USER || "thevidu@gssintl.biz";
+const TRAX_PASS = process.env.TRAX_PASS || "202561208202690Ts@@@@";
 
 /*
 |--------------------------------------------------------------------------
@@ -1896,6 +1903,242 @@ function readJsonBody(req) {
 
 /*
 |--------------------------------------------------------------------------
+| MODE 8: TRAX TEAM MONITOR  (https://smart-prod.trax-cloud.com)
+|--------------------------------------------------------------------------
+| Headless browser (Playwright) ekakin Trax ekata login wela, dashboard eke
+| dena project name ekata adala locked tasks live ganna.
+|   GET /monitor                  -> dashboard page (dashboard.html)
+|   GET /monitor/project/<name>   -> eka project eke tasks (JSON)
+|   GET /monitor/health           -> login status
+| Project list hardcode naha. Request eke project name eka witarai use wenawa.
+| SLA: TRAX_SLA_MAP eke thiyenawanam eka, nathnam 24 hours.
+|--------------------------------------------------------------------------
+*/
+const TRAX_BASE = "https://smart-prod.trax-cloud.com";
+const TRAX_HOME_URL = `${TRAX_BASE}/home`;
+const TRAX_HEADLESS = process.env.TRAX_HEADLESS !== "false";
+
+const TRAX_SLA_MAP = {
+  cbcdairyil: 20,
+  inbevci: 15,
+  inbevnl: 15,
+  marsbh: 15,
+  marskw: 15,
+  marsom: 15,
+  marsqa: 15,
+  marsuae: 15,
+  risparkwinede: 15,
+  straussdryil: 15,
+  straussfritolayil: 60,
+  straussil: 15,
+  tevade: 20,
+  tevapl: 20,
+  tevaru: 20,
+};
+const TRAX_DEFAULT_SLA = 24 * 60;
+const traxGetSla = (name) => TRAX_SLA_MAP[name] ?? TRAX_DEFAULT_SLA;
+
+const TRAX_ALLOWED_TASK_TYPES = ["voting_engine", "stitching", "validation", "voting"];
+const TRAX_SLA_TYPES = ["validation", "stitching"];
+
+class TraxAuthError extends Error {}
+
+let traxBrowser = null;
+let traxContext = null;
+let traxPage = null;
+let traxLoggedIn = false;
+let traxLoggingIn = null;
+const traxStartTimes = new Map();
+
+const traxFmt = (s) => `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
+
+async function traxEnsureBrowser() {
+  if (traxContext) return;
+  let chromium;
+  try {
+    ({ chromium } = require("playwright"));
+  } catch (e) {
+    throw new Error("playwright not installed. Run: npm install playwright && npx playwright install chromium");
+  }
+  traxBrowser = await chromium.launch({ headless: TRAX_HEADLESS, args: ["--no-sandbox"] });
+  traxContext = await traxBrowser.newContext();
+}
+
+function traxLogin() {
+  if (traxLoggingIn) return traxLoggingIn;
+  traxLoggingIn = (async () => {
+    await traxEnsureBrowser();
+    console.log("[TRAX] Logging in...");
+    traxLoggedIn = false;
+    if (traxPage) await traxPage.close().catch(() => {});
+    traxPage = await traxContext.newPage();
+    await traxPage.goto(TRAX_HOME_URL, { waitUntil: "domcontentloaded" });
+    await traxPage.waitForSelector('input[type="password"]', { timeout: 20000 }).catch(() => {});
+
+    const pass = await traxPage.$('input[type="password"]');
+    if (pass) {
+      const user = await traxPage.$(
+        'input[type="email"], input[name*="user" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input[type="text"]'
+      );
+      if (!user) throw new Error("Username field not found");
+      await user.fill(TRAX_USER);
+      await pass.fill(TRAX_PASS);
+      await Promise.all([
+        traxPage.waitForLoadState("networkidle").catch(() => {}),
+        traxPage.click('button[type="submit"], input[type="submit"]').catch(async () => {
+          await traxPage.getByRole("button", { name: /log\s?in|sign\s?in/i }).click();
+        }),
+      ]);
+      await traxPage.waitForTimeout(4000);
+    }
+
+    if (await traxPage.$('input[type="password"]')) {
+      await traxPage.screenshot({ path: "trax-login-failed.png" }).catch(() => {});
+      throw new Error("Trax login failed (password field still visible). See trax-login-failed.png (MFA/captcha/wrong password?)");
+    }
+    traxLoggedIn = true;
+    console.log("[TRAX] Login OK");
+  })().finally(() => { traxLoggingIn = null; });
+  return traxLoggingIn;
+}
+
+async function traxFetchOnce(project) {
+  const r = await traxContext.request.get(`${TRAX_BASE}/api/team-leader/${project}/lockedTasks`, {
+    timeout: 12000,
+    headers: { Accept: "application/json" },
+  });
+  const status = r.status();
+  const ct = r.headers()["content-type"] || "";
+  if (status === 401) throw new TraxAuthError("session expired (401)");
+  if (status === 403) throw new Error("no access to this project (403)");
+  if (status === 404) throw new Error("project not found (404)");
+  if (!r.ok()) throw new Error(`Trax returned HTTP ${status}`);
+  const text = await r.text();
+  if (!text.trim()) return [];
+  if (!ct.includes("json") && text.trim().startsWith("<")) throw new TraxAuthError("got login page instead of data");
+  try {
+    const j = JSON.parse(text);
+    return Array.isArray(j) ? j : [];
+  } catch (e) {
+    throw new Error("Trax returned invalid JSON");
+  }
+}
+
+async function traxFetchProject(project) {
+  if (!traxLoggedIn) await traxLogin();
+  try {
+    return await traxFetchOnce(project);
+  } catch (e) {
+    if (e instanceof TraxAuthError) {
+      await traxLogin();
+      return await traxFetchOnce(project);
+    }
+    throw e;
+  }
+}
+
+function traxProcessRows(raw, project, slaMins) {
+  const now = Date.now();
+  const live = new Set();
+  const rows = [];
+  for (const td of raw) {
+    if (!TRAX_ALLOWED_TASK_TYPES.includes(td.taskType)) continue;
+    if (!td.lockedBy || td.lockedBy === "undefined" || td.lockedBy === "N/A") continue;
+    const key = `${project}|${td.lockedBy}_${td.taskType}_${td.objectId}_${td.uuid}`;
+    live.add(key);
+    if (!traxStartTimes.has(key)) traxStartTimes.set(key, td.pullDate ? new Date(td.pullDate).getTime() : now);
+    const dur = Math.floor((now - traxStartTimes.get(key)) / 1000);
+    const created = td.insertDate ? new Date(td.insertDate).getTime() : now;
+    const tracked = TRAX_SLA_TYPES.includes(td.taskType);
+    const remaining = tracked ? slaMins * 60 - Math.floor((now - created) / 1000) : null;
+    rows.push({
+      email: td.lockedBy,
+      taskType: td.taskType,
+      project,
+      objectId: td.objectId || "N/A",
+      durationSeconds: dur,
+      duration: traxFmt(dur),
+      remainingSeconds: remaining,
+      slaMinutes: tracked ? slaMins : null,
+      created: new Date(created).toISOString(),
+    });
+  }
+  for (const k of traxStartTimes.keys()) {
+    if (k.startsWith(project + "|") && !live.has(k)) traxStartTimes.delete(k);
+  }
+  return rows;
+}
+
+// true => request eka handle kala, false => anith routes walata yanna
+async function handleTraxMonitor(req, res, pathname) {
+  if (req.method !== "GET") return false;
+
+  if (pathname === "/monitor" || pathname === "/monitor/") {
+    fs.readFile(TRAX_DASHBOARD_PATH, "utf8", (err, html) => {
+      if (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "dashboard.html not found next to server.js: " + err.message }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+    });
+    return true;
+  }
+
+  if (pathname === "/monitor/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ loggedIn: traxLoggedIn, user: TRAX_USER }));
+    return true;
+  }
+
+  if (pathname.startsWith("/monitor/project/")) {
+    let name;
+    try {
+      name = decodeURIComponent(pathname.slice("/monitor/project/".length)).trim().toLowerCase();
+    } catch (e) {
+      name = "";
+    }
+    if (!/^[a-z0-9_-]{1,60}$/.test(name)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid project name" }));
+      return true;
+    }
+    try {
+      const sla = traxGetSla(name);
+      const raw = await traxFetchProject(name);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        project: name,
+        sla,
+        updatedAt: new Date().toISOString(),
+        tasks: traxProcessRows(raw, name, sla),
+      }));
+    } catch (e) {
+      console.error("[TRAX] Request error:", name, e.message);
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function startTraxMonitor() {
+  traxLogin().catch((e) => console.error("[TRAX] Initial login failed (will retry on first request):", e.message));
+  setInterval(() => {
+    if (traxPage) traxPage.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  }, 10 * 60 * 1000);
+}
+
+process.on("SIGINT", async () => {
+  try { if (traxBrowser) await traxBrowser.close(); } catch (e) {}
+  process.exit(0);
+});
+
+/*
+|--------------------------------------------------------------------------
 | HTTP SERVER WITH CORS
 |--------------------------------------------------------------------------
 */
@@ -1926,16 +2169,20 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // MODE 8: Trax Team Monitor (/monitor, /monitor/project/<name>, /monitor/health)
+    if (await handleTraxMonitor(req, res, pathname)) return;
+
     // Health check
     if (pathname === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
-        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor / Cancellation)",
+        service: "QAT Server - Unified (TL / Staff ID / Project-Task / Planning / Outflow / Queue Monitor / Cancellation / Trax Team Monitor)",
         time: new Date().toISOString(),
         cors: "enabled",
         outflow_auto_interval_sec: OUTFLOW_AUTO_INTERVAL_SEC,
-        queue_auto_interval_sec: QUEUE_INTERVAL_SEC
+        queue_auto_interval_sec: QUEUE_INTERVAL_SEC,
+        trax_logged_in: traxLoggedIn
       }));
       return;
     }
@@ -2400,6 +2647,8 @@ server.listen(PORT, HOST, () => {
   console.log(`    GET  /cancellation-columns              - Cancellation table columns`);
   console.log(`    GET  /queue-monitor/status              - Queue monitor status`);
   console.log(`    GET  /queue-monitor/refresh             - Run one queue monitor cycle now`);
+  console.log(`    GET  /monitor                           - Trax Team Monitor dashboard`);
+  console.log(`    GET  /monitor/project/<name>            - Trax locked tasks for one project (live)`);
   console.log(`    GET  /planning-ui                       - Planning Tracker page (no login needed to load it)`);
   console.log(`    GET  /planning                          - List planning entries`);
   console.log(`    POST /planning                          - Add {project_name,task_name,target}`);
@@ -2413,4 +2662,5 @@ server.listen(PORT, HOST, () => {
 
   startOutflowAutoLoop();
   startQueueAutoLoop();
+  startTraxMonitor();
 });
