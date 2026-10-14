@@ -1,15 +1,10 @@
 {
   "name": "qat-server-unified",
-  "version": "1.0.0",
-  "description": "QAT Server - Unified (Team Leaders + Staff ID + Project/Task filtered)",
+  "version": "2.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "axios": "^1.7.7"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "axios": "^1.7.0",
+    "playwright": "^1.48.0"
   }
 }
