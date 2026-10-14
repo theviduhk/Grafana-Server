@@ -2038,6 +2038,17 @@ function traxHintFor(message) {
   return null;
 }
 
+// Is Chromium actually installed on this machine? (shown in /monitor/health and in the startup log)
+function traxChromiumInfo() {
+  try {
+    const { chromium } = require("playwright");
+    const p = chromium.executablePath();
+    return { installed: fs.existsSync(p), path: p };
+  } catch (e) {
+    return { installed: false, path: null, error: e.message.split("\n")[0] };
+  }
+}
+
 async function traxResetBrowser() {
   traxLoggedIn = false;
   try { if (traxPage) await traxPage.close(); } catch (e) {}
@@ -2080,6 +2091,11 @@ function traxLogin() {
       traxLoggedIn = false;
       if (traxPage) await traxPage.close().catch(() => {});
       traxPage = await traxContext.newPage();
+      // login only needs HTML/JS/CSS: skip images, fonts and media to save memory on small instances
+      await traxPage.route("**/*", (route) => {
+        const t = route.request().resourceType();
+        return t === "image" || t === "media" || t === "font" ? route.abort() : route.continue();
+      }).catch(() => {});
       await traxPage.goto(TRAX_HOME_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
       await traxPage.waitForSelector('input[type="password"]', { timeout: 20000 }).catch(() => {});
 
@@ -2272,6 +2288,9 @@ async function handleTraxMonitor(req, res, pathname, query) {
       loggingIn: !!traxLoggingIn,
       browserRunning: !!(traxBrowser && traxBrowser.isConnected()),
       lastError: traxLoginError,
+      chromium: traxChromiumInfo(),
+      memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+      node: process.version,
     });
     return true;
   }
@@ -2306,6 +2325,7 @@ async function handleTraxMonitor(req, res, pathname, query) {
 }
 
 function startTraxMonitor() {
+  console.log("[TRAX] Chromium check:", JSON.stringify(traxChromiumInfo()), "| node", process.version);
   traxLogin().catch((e) => console.error("[TRAX] Initial login failed (will retry on request):", e.message));
   setInterval(() => {
     if (traxPage && traxLoggedIn) traxPage.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
