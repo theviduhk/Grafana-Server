@@ -1,8 +1,16 @@
+// Local development: load .env if present (Node 20.12+ / 21.7+). On Render use dashboard env vars.
+const fs = require("fs");
+try {
+  if (typeof process.loadEnvFile === "function" && fs.existsSync(".env")) process.loadEnvFile(".env");
+} catch (e) {
+  console.warn("⚠️ Could not load .env:", e.message);
+}
+
 const axios = require("axios");
 const http = require("http");
 const url = require("url");
-const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 /*
 |--------------------------------------------------------------------------
@@ -120,28 +128,51 @@ const ROSTER_CACHE_MS = Number(process.env.ROSTER_CACHE_SEC ?? 300) * 1000;
 
 /*
 |--------------------------------------------------------------------------
-| CREDENTIALS  (.env nathuwa, methanama)
+| CREDENTIALS  (stored in this file - no .env needed)
+|--------------------------------------------------------------------------
+| Edit the values in CREDENTIALS below. If an environment variable with the
+| same name is set (e.g. in Render), it overrides the value here.
+| Keep this file in a PRIVATE repo - anyone who can read it can read these.
 |--------------------------------------------------------------------------
 */
-const AUTH_USER = process.env.AUTH_USER || "admin";
-const AUTH_PASS = process.env.AUTH_PASS || "password123";
-const GRAFANA_USER = process.env.GRAFANA_USER || "gss.kurunegala@gssintl.biz";
-const GRAFANA_PASS = process.env.GRAFANA_PASS || "Gssk@2021";
+const CREDENTIALS = {
+  // Basic-Auth login for this server (dashboard / React apps use this)
+  AUTH_USER: "admin",
+  AUTH_PASS: "password123",
 
-// Trax (https://smart-prod.trax-cloud.com/home) login - MODE 8 (Team Monitor)
-const TRAX_USER = process.env.TRAX_USER || "thevidu@gssintl.biz";
-const TRAX_PASS = process.env.TRAX_PASS || "202561208202690Ts@@@@";
+  // Grafana (BigQuery proxy + queue monitor)
+  GRAFANA_USER: "gss.kurunegala@gssintl.biz",
+  GRAFANA_PASS: "Gssk@2021",
+
+  // Trax (https://smart-prod.trax-cloud.com/home) login - MODE 8 (Team Monitor)
+  TRAX_USER: "thevidu@gssintl.biz",
+  TRAX_PASS: "202561208202690Ts@@@@",
+};
+const cred = (k) => process.env[k] || CREDENTIALS[k];
+
+const AUTH_USER = cred("AUTH_USER");
+const AUTH_PASS = cred("AUTH_PASS");
+const GRAFANA_USER = cred("GRAFANA_USER");
+const GRAFANA_PASS = cred("GRAFANA_PASS");
+const TRAX_USER = cred("TRAX_USER");
+const TRAX_PASS = cred("TRAX_PASS");
+
+// Paths that can be opened without Basic Auth (comma separated). Default: only the static planning page.
+const AUTH_EXEMPT_PATHS = (process.env.AUTH_EXEMPT_PATHS ?? "/planning-ui")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 /*
 |--------------------------------------------------------------------------
 | CORS HEADERS
 |--------------------------------------------------------------------------
+| CORS_ORIGIN defaults to "*". Auth uses the Authorization header (not cookies),
+| so "*" works. Set CORS_ORIGIN=https://your-site.com to lock it down.
+|--------------------------------------------------------------------------
 */
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept",
-  "Access-Control-Allow-Credentials": "true",
   "Access-Control-Max-Age": "86400"
 };
 
@@ -151,14 +182,26 @@ function setCorsHeaders(res) {
   });
 }
 
+// constant-time compare (hash first so lengths always match)
+function safeEqual(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 function authenticate(req) {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return false;
+  if (!authHeader || !/^Basic\s+/i.test(authHeader)) return false;
   try {
-    const base64 = authHeader.split(' ')[1];
-    const credentials = Buffer.from(base64, 'base64').toString('utf8');
-    const [user, pass] = credentials.split(':');
-    return user === AUTH_USER && pass === AUTH_PASS;
+    const base64 = authHeader.replace(/^Basic\s+/i, "").trim();
+    const credentials = Buffer.from(base64, "base64").toString("utf8");
+    const idx = credentials.indexOf(":");           // password may itself contain ":"
+    if (idx < 0) return false;
+    const user = credentials.slice(0, idx);
+    const pass = credentials.slice(idx + 1);
+    const userOk = safeEqual(user, AUTH_USER);
+    const passOk = safeEqual(pass, AUTH_PASS);
+    return userOk && passOk;
   } catch {
     return false;
   }
@@ -1905,18 +1948,30 @@ function readJsonBody(req) {
 |--------------------------------------------------------------------------
 | MODE 8: TRAX TEAM MONITOR  (https://smart-prod.trax-cloud.com)
 |--------------------------------------------------------------------------
-| Headless browser (Playwright) ekakin Trax ekata login wela, dashboard eke
-| dena project name ekata adala locked tasks live ganna.
+| Headless browser (Playwright) logs in to Trax, then reads the locked tasks
+| for whichever project name the dashboard asks for.
 |   GET /monitor                  -> dashboard page (dashboard.html)
-|   GET /monitor/project/<name>   -> eka project eke tasks (JSON)
-|   GET /monitor/health           -> login status
-| Project list hardcode naha. Request eke project name eka witarai use wenawa.
-| SLA: TRAX_SLA_MAP eke thiyenawanam eka, nathnam 24 hours.
+|   GET /monitor/project/<name>   -> locked tasks for one project (JSON)
+|   GET /monitor/health           -> login status (+ last login error)
+|   GET /monitor/health?retry=1   -> also forces a fresh login attempt
+|
+| HTTP status codes returned by /monitor/project/<name>:
+|   200  ok
+|   400  invalid project name
+|   403  your Trax account has no access to this project
+|   404  project not found on Trax
+|   503  server cannot reach Trax (browser failed to start / login failed)
+|        -> body has { error, code, hint } with the REAL reason
+|   502  Trax answered with something unexpected (HTTP 5xx, bad JSON ...)
+|
+| SLA: from TRAX_SLA_MAP, otherwise 24 hours.
 |--------------------------------------------------------------------------
 */
 const TRAX_BASE = "https://smart-prod.trax-cloud.com";
 const TRAX_HOME_URL = `${TRAX_BASE}/home`;
 const TRAX_HEADLESS = process.env.TRAX_HEADLESS !== "false";
+const TRAX_CACHE_MS = Number(process.env.TRAX_CACHE_SEC ?? 4) * 1000;              // per-project response cache
+const TRAX_LOGIN_COOLDOWN_MS = Number(process.env.TRAX_LOGIN_COOLDOWN_SEC ?? 30) * 1000; // wait after a failed login
 
 const TRAX_SLA_MAP = {
   cbcdairyil: 20,
@@ -1941,77 +1996,145 @@ const traxGetSla = (name) => TRAX_SLA_MAP[name] ?? TRAX_DEFAULT_SLA;
 const TRAX_ALLOWED_TASK_TYPES = ["voting_engine", "stitching", "validation", "voting"];
 const TRAX_SLA_TYPES = ["validation", "stitching"];
 
+// session expired -> relogin and retry once
 class TraxAuthError extends Error {}
+// Trax itself said 403 / 404 -> pass the same status to the dashboard
+class TraxHttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+// we could not even get logged in (browser missing, wrong password, captcha ...)
+class TraxUnavailableError extends Error {
+  constructor(message, hint) { super(message); this.hint = hint || null; }
+}
 
 let traxBrowser = null;
 let traxContext = null;
 let traxPage = null;
 let traxLoggedIn = false;
 let traxLoggingIn = null;
+let traxLoginError = null;       // { message, hint, at }
+let traxLoginFailedAt = 0;
 const traxStartTimes = new Map();
 
 const traxFmt = (s) => `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
 
+function traxHintFor(message) {
+  const m = String(message || "");
+  if (/Executable doesn't exist|browserType\.launch|playwright install/i.test(m)) {
+    return "Chromium is not installed on the server. Deploy with the provided Dockerfile (it ships Chromium and its system libraries).";
+  }
+  if (/error while loading shared libraries|libnss3|libatk|libgbm|libasound/i.test(m)) {
+    return "Chromium system libraries are missing. Deploy with the provided Dockerfile.";
+  }
+  if (/playwright not installed|Cannot find module 'playwright'/i.test(m)) {
+    return "The playwright package is not installed. Run npm install.";
+  }
+  if (/Target (page, context or browser )?has been closed|crash|out of memory|SIGKILL/i.test(m)) {
+    return "Chromium crashed, most likely out of memory on a small instance. Use a bigger instance or keep only one dashboard tab open.";
+  }
+  if (/login failed|password field still visible/i.test(m)) {
+    return "Trax rejected the login. Check TRAX_USER / TRAX_PASS (or the account needs MFA / captcha).";
+  }
+  return null;
+}
+
+async function traxResetBrowser() {
+  traxLoggedIn = false;
+  try { if (traxPage) await traxPage.close(); } catch (e) {}
+  try { if (traxContext) await traxContext.close(); } catch (e) {}
+  try { if (traxBrowser) await traxBrowser.close(); } catch (e) {}
+  traxPage = null;
+  traxContext = null;
+  traxBrowser = null;
+}
+
 async function traxEnsureBrowser() {
-  if (traxContext) return;
+  if (traxContext && traxBrowser && traxBrowser.isConnected()) return;
+  if (traxBrowser) await traxResetBrowser();   // browser died -> start clean
   let chromium;
   try {
     ({ chromium } = require("playwright"));
   } catch (e) {
     throw new Error("playwright not installed. Run: npm install playwright && npx playwright install chromium");
   }
-  traxBrowser = await chromium.launch({ headless: TRAX_HEADLESS, args: ["--no-sandbox"] });
+  traxBrowser = await chromium.launch({
+    headless: TRAX_HEADLESS,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions"],
+  });
+  traxBrowser.on("disconnected", () => {
+    console.error("[TRAX] Browser disconnected");
+    traxLoggedIn = false;
+    traxBrowser = null;
+    traxContext = null;
+    traxPage = null;
+  });
   traxContext = await traxBrowser.newContext();
 }
 
 function traxLogin() {
   if (traxLoggingIn) return traxLoggingIn;
   traxLoggingIn = (async () => {
-    await traxEnsureBrowser();
-    console.log("[TRAX] Logging in...");
-    traxLoggedIn = false;
-    if (traxPage) await traxPage.close().catch(() => {});
-    traxPage = await traxContext.newPage();
-    await traxPage.goto(TRAX_HOME_URL, { waitUntil: "domcontentloaded" });
-    await traxPage.waitForSelector('input[type="password"]', { timeout: 20000 }).catch(() => {});
+    try {
+      await traxEnsureBrowser();
+      console.log("[TRAX] Logging in...");
+      traxLoggedIn = false;
+      if (traxPage) await traxPage.close().catch(() => {});
+      traxPage = await traxContext.newPage();
+      await traxPage.goto(TRAX_HOME_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await traxPage.waitForSelector('input[type="password"]', { timeout: 20000 }).catch(() => {});
 
-    const pass = await traxPage.$('input[type="password"]');
-    if (pass) {
-      const user = await traxPage.$(
-        'input[type="email"], input[name*="user" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input[type="text"]'
-      );
-      if (!user) throw new Error("Username field not found");
-      await user.fill(TRAX_USER);
-      await pass.fill(TRAX_PASS);
-      await Promise.all([
-        traxPage.waitForLoadState("networkidle").catch(() => {}),
-        traxPage.click('button[type="submit"], input[type="submit"]').catch(async () => {
-          await traxPage.getByRole("button", { name: /log\s?in|sign\s?in/i }).click();
-        }),
-      ]);
-      await traxPage.waitForTimeout(4000);
-    }
+      const pass = await traxPage.$('input[type="password"]');
+      if (pass) {
+        const user = await traxPage.$(
+          'input[type="email"], input[name*="user" i], input[name*="email" i], input[id*="user" i], input[id*="email" i], input[type="text"]'
+        );
+        if (!user) throw new Error("Username field not found on the Trax login page");
+        await user.fill(TRAX_USER);
+        await pass.fill(TRAX_PASS);
+        await Promise.all([
+          traxPage.waitForLoadState("networkidle").catch(() => {}),
+          traxPage.click('button[type="submit"], input[type="submit"]').catch(async () => {
+            await traxPage.getByRole("button", { name: /log\s?in|sign\s?in/i }).click();
+          }),
+        ]);
+        await traxPage.waitForTimeout(4000);
+      }
 
-    if (await traxPage.$('input[type="password"]')) {
-      await traxPage.screenshot({ path: "trax-login-failed.png" }).catch(() => {});
-      throw new Error("Trax login failed (password field still visible). See trax-login-failed.png (MFA/captcha/wrong password?)");
+      if (await traxPage.$('input[type="password"]')) {
+        await traxPage.screenshot({ path: "trax-login-failed.png" }).catch(() => {});
+        throw new Error("Trax login failed (password field still visible). See trax-login-failed.png (MFA/captcha/wrong password?)");
+      }
+      traxLoggedIn = true;
+      traxLoginError = null;
+      traxLoginFailedAt = 0;
+      console.log("[TRAX] Login OK");
+    } catch (e) {
+      traxLoggedIn = false;
+      traxLoginFailedAt = Date.now();
+      traxLoginError = { message: e.message.split("\n")[0], hint: traxHintFor(e.message), at: new Date().toISOString() };
+      console.error("[TRAX] Login failed:", e.message);
+      throw new TraxUnavailableError(traxLoginError.message, traxLoginError.hint);
     }
-    traxLoggedIn = true;
-    console.log("[TRAX] Login OK");
   })().finally(() => { traxLoggingIn = null; });
   return traxLoggingIn;
 }
 
 async function traxFetchOnce(project) {
-  const r = await traxContext.request.get(`${TRAX_BASE}/api/team-leader/${project}/lockedTasks`, {
-    timeout: 12000,
-    headers: { Accept: "application/json" },
-  });
+  if (!traxContext) throw new TraxAuthError("no browser session");
+  let r;
+  try {
+    r = await traxContext.request.get(`${TRAX_BASE}/api/team-leader/${project}/lockedTasks`, {
+      timeout: 12000,
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    throw new Error(`Could not reach Trax: ${e.message.split("\n")[0]}`);
+  }
   const status = r.status();
   const ct = r.headers()["content-type"] || "";
   if (status === 401) throw new TraxAuthError("session expired (401)");
-  if (status === 403) throw new Error("no access to this project (403)");
-  if (status === 404) throw new Error("project not found (404)");
+  if (status === 403) throw new TraxHttpError(403, `No access to project "${project}" with this Trax account (403)`);
+  if (status === 404) throw new TraxHttpError(404, `Project "${project}" not found on Trax (404)`);
   if (!r.ok()) throw new Error(`Trax returned HTTP ${status}`);
   const text = await r.text();
   if (!text.trim()) return [];
@@ -2024,12 +2147,22 @@ async function traxFetchOnce(project) {
   }
 }
 
+async function traxEnsureLoggedIn() {
+  if (traxLoggedIn) return;
+  // do not hammer Trax / relaunch Chromium on every poll after a failure
+  if (traxLoginError && Date.now() - traxLoginFailedAt < TRAX_LOGIN_COOLDOWN_MS) {
+    throw new TraxUnavailableError(traxLoginError.message, traxLoginError.hint);
+  }
+  await traxLogin();
+}
+
 async function traxFetchProject(project) {
-  if (!traxLoggedIn) await traxLogin();
+  await traxEnsureLoggedIn();
   try {
     return await traxFetchOnce(project);
   } catch (e) {
     if (e instanceof TraxAuthError) {
+      traxLoggedIn = false;
       await traxLogin();
       return await traxFetchOnce(project);
     }
@@ -2069,26 +2202,77 @@ function traxProcessRows(raw, project, slaMins) {
   return rows;
 }
 
-// true => request eka handle kala, false => anith routes walata yanna
-async function handleTraxMonitor(req, res, pathname) {
+// Per-project cache + in-flight de-duplication: 10 open dashboards = 1 Trax request per interval.
+const traxCache = new Map();   // project -> { ts, payload, promise }
+
+async function traxGetProjectPayload(name) {
+  const now = Date.now();
+  const hit = traxCache.get(name);
+  if (hit) {
+    if (hit.promise) return hit.promise;
+    if (hit.payload && now - hit.ts < TRAX_CACHE_MS) return hit.payload;
+  }
+
+  const promise = (async () => {
+    const sla = traxGetSla(name);
+    const raw = await traxFetchProject(name);
+    return {
+      project: name,
+      sla,
+      updatedAt: new Date().toISOString(),
+      tasks: traxProcessRows(raw, name, sla),
+    };
+  })();
+
+  traxCache.set(name, { ts: now, payload: null, promise });
+  try {
+    const payload = await promise;
+    traxCache.set(name, { ts: Date.now(), payload, promise: null });
+    return payload;
+  } catch (e) {
+    traxCache.delete(name);        // never cache errors
+    throw e;
+  } finally {
+    if (traxCache.size > 100) {    // keep memory bounded
+      for (const [k, v] of traxCache) {
+        if (!v.promise && Date.now() - v.ts > 60000) traxCache.delete(k);
+      }
+    }
+  }
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+
+// true => request handled, false => fall through to the other routes
+async function handleTraxMonitor(req, res, pathname, query) {
   if (req.method !== "GET") return false;
 
   if (pathname === "/monitor" || pathname === "/monitor/") {
     fs.readFile(TRAX_DASHBOARD_PATH, "utf8", (err, html) => {
       if (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "dashboard.html not found next to server.js: " + err.message }));
+        sendJson(res, 500, { error: "dashboard.html not found next to server.js" });
         return;
       }
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
       res.end(html);
     });
     return true;
   }
 
   if (pathname === "/monitor/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ loggedIn: traxLoggedIn, user: TRAX_USER }));
+    if (query && query.retry && !traxLoggedIn && !traxLoggingIn) {
+      traxLoginFailedAt = 0;
+      await traxLogin().catch(() => {});   // result is reflected in loggedIn / lastError below
+    }
+    sendJson(res, 200, {
+      loggedIn: traxLoggedIn,
+      loggingIn: !!traxLoggingIn,
+      browserRunning: !!(traxBrowser && traxBrowser.isConnected()),
+      lastError: traxLoginError,
+    });
     return true;
   }
 
@@ -2100,24 +2284,20 @@ async function handleTraxMonitor(req, res, pathname) {
       name = "";
     }
     if (!/^[a-z0-9_-]{1,60}$/.test(name)) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid project name" }));
+      sendJson(res, 400, { error: "Invalid project name" });
       return true;
     }
     try {
-      const sla = traxGetSla(name);
-      const raw = await traxFetchProject(name);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        project: name,
-        sla,
-        updatedAt: new Date().toISOString(),
-        tasks: traxProcessRows(raw, name, sla),
-      }));
+      sendJson(res, 200, await traxGetProjectPayload(name));
     } catch (e) {
       console.error("[TRAX] Request error:", name, e.message);
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
+      if (e instanceof TraxHttpError) {
+        sendJson(res, e.status, { error: e.message, code: `trax_${e.status}` });
+      } else if (e instanceof TraxUnavailableError) {
+        sendJson(res, 503, { error: e.message, code: "trax_unavailable", hint: e.hint });
+      } else {
+        sendJson(res, 502, { error: e.message, code: "trax_upstream", hint: traxHintFor(e.message) });
+      }
     }
     return true;
   }
@@ -2126,16 +2306,19 @@ async function handleTraxMonitor(req, res, pathname) {
 }
 
 function startTraxMonitor() {
-  traxLogin().catch((e) => console.error("[TRAX] Initial login failed (will retry on first request):", e.message));
+  traxLogin().catch((e) => console.error("[TRAX] Initial login failed (will retry on request):", e.message));
   setInterval(() => {
-    if (traxPage) traxPage.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    if (traxPage && traxLoggedIn) traxPage.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
   }, 10 * 60 * 1000);
 }
 
-process.on("SIGINT", async () => {
+async function shutdown() {
   try { if (traxBrowser) await traxBrowser.close(); } catch (e) {}
   process.exit(0);
-});
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
 
 /*
 |--------------------------------------------------------------------------
@@ -2157,7 +2340,6 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsed.pathname;
   const query = parsed.query;
 
-  const AUTH_EXEMPT_PATHS = ["/fetch-filtered", "/planning-ui"];
   if (!AUTH_EXEMPT_PATHS.includes(pathname) && !authenticate(req)) {
     console.log(`  ❌ Unauthorized: ${req.url}`);
     res.writeHead(401, {
@@ -2170,7 +2352,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     // MODE 8: Trax Team Monitor (/monitor, /monitor/project/<name>, /monitor/health)
-    if (await handleTraxMonitor(req, res, pathname)) return;
+    if (await handleTraxMonitor(req, res, pathname, query)) return;
 
     // Health check
     if (pathname === "/" && req.method === "GET") {
@@ -2311,7 +2493,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!project || !task) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "project සහ task දෙකම required" }));
+        res.end(JSON.stringify({ error: "project and task are both required" }));
         return;
       }
 
@@ -2608,12 +2790,9 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: "Not found" }));
   } catch (error) {
     console.error("❌ Server Error:", error.message);
-    console.error("  Stack:", error.stack);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: error.message,
-      details: error.stack
-    }));
+    console.error("  Stack:", error.stack);       // stack stays in the server log, never sent to the client
+    if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: error.message }));
   }
 });
 
