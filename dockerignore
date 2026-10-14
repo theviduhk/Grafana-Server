@@ -1,7 +1,0 @@
-node_modules
-.env
-.git
-*.png
-*.log
-Dockerfile
-.dockerignore
