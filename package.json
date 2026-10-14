@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "postinstall": "playwright install chromium chromium-headless-shell"
+    "postinstall": "playwright install --only-shell chromium"
   },
   "dependencies": {
     "axios": "^1.7.0",
